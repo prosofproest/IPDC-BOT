@@ -1,0 +1,10 @@
+// The bot uses the Firebase Admin SDK (service account), which bypasses these rules.
+// Deny every client SDK read/write so no data is reachable from browsers or apps.
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

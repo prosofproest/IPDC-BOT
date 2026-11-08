@@ -1,0 +1,4 @@
+__REPLACE_WITH_OWNER_CODE_OF_CONDUCT__
+
+Paste the exact, owner-approved IPDC Code of Conduct text in this file (replace this entire file content).
+The bot posts it verbatim and refuses to proceed with onboarding while this placeholder remains.
