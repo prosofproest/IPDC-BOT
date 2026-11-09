@@ -1,4 +1,61 @@
-__REPLACE_WITH_OWNER_CODE_OF_CONDUCT__
+INVICTUS PROJECT DEVELOPMENT CENTRE (IPDC)
+OFFICIAL CODE OF CONDUCT
 
-Paste the exact, owner-approved IPDC Code of Conduct text in this file (replace this entire file content).
-The bot posts it verbatim and refuses to proceed with onboarding while this placeholder remains.
+1. DECLARATION & COMMITMENT
+
+By becoming a member of the INVICTUS PROJECT DEVELOPMENT CENTRE (IPDC), every individual agrees to maintain discipline, professionalism, integrity, teamwork, and mutual respect.
+
+All members are expected to contribute towards the organization's objectives and uphold its standards.
+
+2. CODE OF CONDUCT
+
+All members must:
+- Treat every member with respect and maintain professional communication.
+- Refrain from harassment, bullying, discrimination, threats, or abusive behavior.
+- Respect the decisions and instructions of authorized Project Managers and Administrators.
+- Maintain confidentiality of internal discussions, project resources, and sensitive information.
+- Avoid plagiarism and acknowledge the contributions of others.
+- Use IPDC channels and resources responsibly.
+- Work collaboratively and fulfill assigned responsibilities.
+- Avoid any activity that damages the reputation or functioning of IPDC.
+
+3. ATTENDANCE & PARTICIPATION
+
+- Every member must maintain a minimum of 75% attendance in assigned meetings, project sessions, and organizational activities.
+- Members are expected to actively participate in their assigned teams and projects.
+- Members must inform their respective Project Manager in advance regarding unavoidable absences.
+- Repeated absence, inactivity, or failure to fulfill responsibilities may lead to disciplinary action.
+
+4. DISCIPLINARY ACTION
+
+Violations of the Code of Conduct may result in:
+- Verbal Warning
+- Written Warning
+- Temporary Suspension
+- Removal from Project Responsibilities
+- Termination of Membership
+
+The disciplinary action will depend on the severity and frequency of the violation.
+
+5. TERMINATION
+
+Membership may be terminated in cases of:
+- Serious or repeated violations of the Code of Conduct.
+- Harassment, misconduct, or inappropriate behavior.
+- Unauthorized disclosure of confidential information.
+- Persistent failure to fulfill assigned responsibilities.
+- Actions that negatively affect the organization or its members.
+
+The final decision regarding termination shall be made by the authorized IPDC Administration.
+
+6. DECLARATION OF ACCEPTANCE
+
+By accepting this Code of Conduct, I confirm that I have read, understood, and agreed to follow the rules, policies, and standards of the INVICTUS PROJECT DEVELOPMENT CENTRE.
+
+I understand that failure to comply may result in disciplinary action, including termination of membership.
+
+ACCEPTANCE BUTTONS:
+I AGREE — ACCEPT CODE OF CONDUCT
+I DO NOT AGREE
+
+INVICTUS PROJECT DEVELOPMENT CENTRE (IPDC)
