@@ -90,7 +90,10 @@ test('logo asset is byte-identical to the owner supplied file', () => {
 
 test('Code of Conduct: placeholder blocks onboarding; owner text is returned untouched', () => {
   const cfg = loadConfig({}, { strict: false });
-  assert.equal(loadCodeOfConduct(cfg).configured, false, 'shipped placeholder must block');
+  const tmpPlaceholder = `${process.env.TMPDIR || '/tmp'}/coc-placeholder.txt`;
+  fs.writeFileSync(tmpPlaceholder, '__REPLACE_WITH_OWNER_CODE_OF_CONDUCT__\nplaceholder');
+  assert.equal(loadCodeOfConduct({ ...cfg, cocFile: tmpPlaceholder }).configured, false, 'shipped placeholder must block');
+  fs.rmSync(tmpPlaceholder);
   const tmp = `${process.env.TMPDIR || '/tmp'}/coc-test.txt`;
   const text = 'Line one  with  double spaces\n\n“Curly quotes” — and   trailing spaces   \nFinal line';
   fs.writeFileSync(tmp, text);

@@ -47,9 +47,9 @@ export function loadConfig(env = process.env, { strict = true } = {}) {
     },
     github: {
       enabled: githubApp || githubToken,
-      appId: env.GITHUB_APP_ID,
-      privateKey: normalizePrivateKey(env.GITHUB_APP_PRIVATE_KEY),
-      installationId: env.GITHUB_INSTALLATION_ID,
+      appId: githubApp ? env.GITHUB_APP_ID : null,
+      privateKey: githubApp ? normalizePrivateKey(env.GITHUB_APP_PRIVATE_KEY) : null,
+      installationId: githubApp ? env.GITHUB_INSTALLATION_ID : null,
       token: githubToken ? env.GITHUB_TOKEN : null,
       webhookSecret: present(env.GITHUB_WEBHOOK_SECRET) ? env.GITHUB_WEBHOOK_SECRET : null,
     },

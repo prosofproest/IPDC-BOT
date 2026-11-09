@@ -179,7 +179,7 @@ export function register(router, ctx) {
     if (!username) { await say(i, { embeds: [errEmbed('That does not look like a GitHub profile URL. Example: https://github.com/your-username')] }); return null; }
     let info;
     try { info = await ctx.github.verifyUser(username); } catch (e) {
-      log.warn('github verify failed', e);
+      log.warn(`GitHub verification failed for "${username}": ${e.status ? `HTTP ${e.status} - ` : ''}${e.message}`);
       await say(i, { embeds: [errEmbed('GitHub could not be reached to verify your profile. Please try again in a few minutes.')] }); return null;
     }
     if (!info) { await say(i, { embeds: [errEmbed(`No GitHub user profile named "${username}" was found.`)] }); return null; }

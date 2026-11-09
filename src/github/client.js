@@ -10,18 +10,19 @@ const log = createLogger('github');
  * Without credentials only public profile lookups work (low rate limit) and monitoring is disabled.
  */
 export class GitHubClient {
-  constructor(cfg) {
+  constructor(cfg = {}) {
     this.cfg = cfg; this.enabled = !!cfg.enabled; this.cache = new Map();
     this.health = { lastOkAt: null, lastError: null, rateRemaining: null, rateResetAt: null, calls: 0, errors: 0 };
-    if (cfg.appId && cfg.privateKey && cfg.installationId) {
+    const requestOptions = { timeout: 10_000 };
+    if (this.enabled && cfg.appId && cfg.privateKey && cfg.installationId) {
       this.mode = 'app';
-      this.octokit = new Octokit({ authStrategy: createAppAuth, auth: { appId: cfg.appId, privateKey: cfg.privateKey, installationId: cfg.installationId }, userAgent: 'ipdc-discord-bot' });
-    } else if (cfg.token) {
+      this.octokit = new Octokit({ authStrategy: createAppAuth, auth: { appId: cfg.appId, privateKey: cfg.privateKey, installationId: cfg.installationId }, userAgent: 'ipdc-discord-bot', request: requestOptions });
+    } else if (this.enabled && cfg.token) {
       this.mode = 'token';
-      this.octokit = new Octokit({ auth: cfg.token, userAgent: 'ipdc-discord-bot' });
+      this.octokit = new Octokit({ auth: cfg.token, userAgent: 'ipdc-discord-bot', request: requestOptions });
     } else {
       this.mode = 'public';
-      this.octokit = new Octokit({ userAgent: 'ipdc-discord-bot' });
+      this.octokit = new Octokit({ userAgent: 'ipdc-discord-bot', request: requestOptions });
     }
     this.octokit.hook.after('request', (res) => {
       this.health.calls++; this.health.lastOkAt = Date.now();
@@ -39,7 +40,8 @@ export class GitHubClient {
         const retryAfter = Number(e.response?.headers?.['retry-after']);
         const limited = (e.status === 403 || e.status === 429) && (retryAfter || /rate limit/i.test(e.message));
         if (limited && i < attempts - 1) { await sleep(Math.min(30_000, (retryAfter || 2 ** i * 2) * 1000)); continue; }
-        if (e.status >= 500 && i < attempts - 1) { await sleep(500 * 2 ** i); continue; }
+        const transient = !e.status || e.status >= 500 || e.code === 'ETIMEDOUT' || e.name === 'AbortError';
+        if (transient && i < attempts - 1) { await sleep(500 * 2 ** i); continue; }
         break;
       }
     }
@@ -66,7 +68,23 @@ export class GitHubClient {
       const { data } = await this._call(() => this.octokit.users.getByUsername({ username }));
       if (data.type !== 'User') return null;
       return { login: data.login, id: data.id, url: data.html_url, avatar: data.avatar_url, createdAt: data.created_at };
-    } catch (e) { if (e.status === 404) return null; throw e; }
+    } catch (e) {
+      if (e.status === 404) return null;
+      // If authenticated lookup failed with an auth/permission or server error, fallback to public lookup
+      if (this.mode !== 'public' && (e.status === 401 || e.status === 403 || !e.status || e.status >= 500)) {
+        log.warn(`GitHub profile lookup for "${username}" failed (${e.status || e.code || e.message}) in ${this.mode} mode, falling back to public lookup`);
+        try {
+          const publicOctokit = new Octokit({ userAgent: 'ipdc-discord-bot', request: { timeout: 10_000 } });
+          const { data } = await publicOctokit.users.getByUsername({ username });
+          if (data.type !== 'User') return null;
+          return { login: data.login, id: data.id, url: data.html_url, avatar: data.avatar_url, createdAt: data.created_at };
+        } catch (pubErr) {
+          if (pubErr.status === 404) return null;
+          throw pubErr;
+        }
+      }
+      throw e;
+    }
   }
 
   async getRepo(owner, name) {
