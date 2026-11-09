@@ -1,14 +1,15 @@
-import admin from 'firebase-admin';
+import { getApps, initializeApp, cert } from 'firebase-admin/app';
+import { getFirestore } from 'firebase-admin/firestore';
 
 // Firestore-backed durable store. Document IDs are sanitized (no '/').
 const safe = (id) => String(id).replace(/\//g, '_');
 
 export class FirestoreStore {
   constructor({ projectId, clientEmail, privateKey }) {
-    if (!admin.apps.length) {
-      admin.initializeApp({ credential: admin.credential.cert({ projectId, clientEmail, privateKey }) });
+    if (!getApps().length) {
+      initializeApp({ credential: cert({ projectId, clientEmail, privateKey }) });
     }
-    this.db = admin.firestore();
+    this.db = getFirestore();
     this.db.settings({ ignoreUndefinedProperties: true });
   }
   async ping() { await this.db.collection('meta').doc('ping').set({ at: Date.now() }); return true; }
