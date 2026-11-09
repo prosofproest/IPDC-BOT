@@ -1,29 +1,40 @@
-import { ActionRowBuilder, ButtonStyle, ModalBuilder, TextInputBuilder, TextInputStyle } from 'discord.js';
+import { ActionRowBuilder, ButtonStyle, ModalBuilder, StringSelectMenuBuilder, TextInputBuilder, TextInputStyle } from 'discord.js';
 import { createLogger } from '../utils/logger.js';
 import { fmtIST, parseRepoRef, truncate } from '../utils/misc.js';
 import { makeActor } from '../core/auth.js';
 import { say } from '../core/router.js';
 import { button, embed, errEmbed, okEmbed, row } from '../ui.js';
+import { BRAND } from '../config/constants.js';
+import { provisionPmWorkspace } from '../core/workspace.js';
 
 const log = createLogger('pm');
 
 export function pmPanelPayload(pm) {
   return {
     embeds: [embed({
-      title: `PM CONTROL PANEL — ${pm.name}`,
+      title: 'PM CONTROL PANEL',
+      color: BRAND.accent,
       description: [
-        'Private to the Project Manager and administrators. Incoming applications and change requests for your team appear in this channel for approval.',
+        'Your private project management channel.',
         '',
-        `Monitored repository: ${pm.repo ? `[${pm.repo.owner}/${pm.repo.name}](${pm.repo.url})` : 'not set'}`,
-        'Your team works on one active repository at a time. GitHub access and permissions are managed by IPDC administrators.',
+        'Use the buttons below to:',
+        '- Manage your teams',
+        '- Set your repository',
+        '- Review requests',
+        '- View team overview',
       ].join('\n'),
     })],
-    components: [row(
-      button(`pm:repo:${pm.id}`, 'SET REPOSITORY', ButtonStyle.Primary),
-      button(`pm:team:${pm.id}`, 'TEAM OVERVIEW'),
-      button(`pm:pending:${pm.id}`, 'PENDING REQUESTS'),
-      button(`pm:refresh:${pm.id}`, 'REFRESH ACTIVITY'),
-    )],
+    components: [
+      row(
+        button(`pm:repo:${pm.id}`, 'SET REPOSITORY', ButtonStyle.Primary),
+        button(`pm:manage-teams:${pm.id}`, 'MANAGE TEAMS', ButtonStyle.Success),
+        button(`pm:team:${pm.id}`, 'TEAM OVERVIEW'),
+      ),
+      row(
+        button(`pm:pending:${pm.id}`, 'PENDING REQUESTS'),
+        button(`pm:refresh:${pm.id}`, 'REFRESH ACTIVITY'),
+      ),
+    ],
   };
 }
 
@@ -81,6 +92,50 @@ export function register(router, ctx) {
     const pending = (await store.where('requests', 'pmId', pmId)).filter((r) => r.status === 'pending');
     const g = ctx.cfg.discord.guildId;
     await say(i, { embeds: [embed({ title: 'PENDING REQUESTS', description: pending.map((r) => `• ${r.type.replace('_', ' ')} — <@${r.userId}> — [open](https://discord.com/channels/${g}/${r.ref?.channelId}/${r.ref?.messageId}) (${fmtIST(r.createdAt)})`).join('\n') || 'No pending requests.' })] });
+  });
+
+  router.button('pm:manage-teams', async (i, [pmId]) => {
+    if (!(await panelOk(i, pmId))) return say(i, { embeds: [errEmbed('Not authorized.')] });
+    const [pm, teams] = await Promise.all([state.getPm(pmId), state.teams()]);
+    if (!pm) return say(i, { embeds: [errEmbed('PM not found.')] });
+    if (!teams.length) return say(i, { embeds: [errEmbed('No team roles configured yet.')] });
+    const opts = teams.slice(0, 25).map((t) => ({
+      label: t.name.slice(0, 100),
+      value: t.id,
+      default: (pm.teamIds || []).includes(t.id),
+    }));
+    await say(i, {
+      content: `Select which team roles you manage for **${pm.name}**. Your PM category channels and resource access will update automatically.`,
+      components: [row(new StringSelectMenuBuilder().setCustomId(`pm:set-teams:${pm.id}`).setPlaceholder('Select assigned team roles').setMinValues(0).setMaxValues(opts.length).addOptions(opts))],
+    });
+  });
+
+  router.select('pm:set-teams', async (i, [pmId]) => {
+    await i.deferUpdate();
+    if (!(await panelOk(i, pmId))) return;
+    const pm = await state.getPm(pmId);
+    if (!pm) return;
+    const before = pm.teamIds || [];
+    await state.updatePm(pmId, { teamIds: i.values });
+    let prov = { rolesAdded: [], rolesRemoved: [], resources: [] };
+    try {
+      prov = await provisionPmWorkspace(ctx, pmId, { welcome: false, auditActorId: i.user.id });
+    } catch (e) {
+      log.warn(`workspace sync failed: ${e.message}`);
+    }
+    const dropped = before.filter((t) => !i.values.includes(t));
+    const added = i.values.filter((t) => !before.includes(t));
+    await audit.log({ action: 'pm.teams_assigned', actorId: i.user.id, details: { pmId, teamIds: i.values, dropped, added } });
+    await i.editReply({
+      content: null,
+      embeds: [okEmbed(
+        `Assigned team roles updated for **${pm.name}**.\n\n` +
+        `• **Active Teams**: ${prov.resources?.length ? prov.resources.map((r) => r.name).join(', ') : 'None'}\n` +
+        `• **Channels Synchronized**: Team text channels and resource visibility have been updated.`,
+        'Teams Updated'
+      )],
+      components: [],
+    });
   });
 
   router.button('pm:refresh', async (i, [pmId]) => {

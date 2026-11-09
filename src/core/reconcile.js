@@ -92,14 +92,19 @@ export class Reconciler {
       }
     }
     if (item.adopt) {
-      const found = await this.adapter.findRole(item.name);
+      let found = await this.adapter.findRole(item.name);
+      if (!found && item.altName) found = await this.adapter.findRole(item.altName);
       if (found && !this._isFixed(found.id)) {
         await this._persist(registry, { key: item.key, type: 'role', id: found.id, name: found.name, adopted: true });
+        if (item.meta?.teamId) await this.state.updateTeam(item.meta.teamId, { roleId: found.id });
+        if (item.meta?.pmId) await this.state.updatePm(item.meta.pmId, { roleId: found.id });
         summary.adopted++; return;
       }
     }
     const created = await this.adapter.createRole({ name: item.name, reason: `IPDC structure: ${item.key}` });
     await this._persist(registry, { key: item.key, type: 'role', id: created.id, name: created.name });
+    if (item.meta?.teamId) await this.state.updateTeam(item.meta.teamId, { roleId: created.id });
+    if (item.meta?.pmId) await this.state.updatePm(item.meta.pmId, { roleId: created.id });
     summary.created++; summary.createdKeys.push(item.key);
   }
 

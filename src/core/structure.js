@@ -61,8 +61,11 @@ export function buildStructure({ pms = [], teams = [], members = [], settings = 
   items.push({ key: G, kind: 'role', name: 'IPDC GRID', fixedId: cfg.roles.grid });
   items.push({ key: A, kind: 'role', name: 'ADMIN', fixedId: cfg.roles.admin });
   items.push({ key: I, kind: 'role', name: 'IPDC', fixedId: cfg.roles.ipdc || undefined, adopt: true });
-  for (const t of teams) items.push({ key: KEYS.teamRole(t.id), kind: 'role', name: t.name, adopt: true, meta: { teamId: t.id } });
-  for (const p of pms) items.push({ key: KEYS.pmRole(p.id), kind: 'role', name: p.name, adopt: true, meta: { pmId: p.id } });
+  for (const t of teams) items.push({ key: KEYS.teamRole(t.id), kind: 'role', name: t.name, fixedId: t.roleId || undefined, adopt: true, meta: { teamId: t.id } });
+  for (const p of pms) {
+    const roleName = p.roleName || (p.name.startsWith('PM - ') ? p.name : `PM - ${p.name}`);
+    items.push({ key: KEYS.pmRole(p.id), kind: 'role', name: roleName, altName: p.name, fixedId: p.roleId || undefined, adopt: true, meta: { pmId: p.id } });
+  }
 
   const cat = (key, name, overwrites) => items.push({ key, kind: 'category', name, overwrites });
   const text = (key, name, parentKey, overwrites, extra = {}) => items.push({ key, kind: 'text', name, parentKey, overwrites, ...extra });
@@ -104,7 +107,7 @@ export function buildStructure({ pms = [], teams = [], members = [], settings = 
       ov(G, FORUM_STAFF),
       ...(adminResources ? [ov(A, FORUM_STAFF)] : []),
       bot(),
-    ], { topic: `Resources for ${t.name}: links, tutorials and material.`, meta: { teamId: t.id } });
+    ], { topic: `Official resources for the ${t.name} team. Resources are posted and maintained by authorized IPDC administrators.`, meta: { teamId: t.id } });
   }
 
   // ---- PM categories ----

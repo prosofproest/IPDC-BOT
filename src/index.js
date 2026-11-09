@@ -29,6 +29,7 @@ import { register as registerPm } from './features/pm.js';
 import { register as registerSupport } from './features/support.js';
 import { register as registerGithub, slashCommands } from './features/github.js';
 import { Audit as AuditCls } from './core/audit.js';
+import { handleRoleCreate, handleRoleUpdate, handleRoleDelete, handleMemberUpdate } from './core/dynamicRoles.js';
 
 const log = createLogger('main');
 
@@ -84,6 +85,26 @@ async function main() {
   });
 
   client.on('interactionCreate', (i) => { if (i.guildId && i.guildId !== cfg.discord.guildId) return; router.dispatch(i); });
+  client.on('roleCreate', async (role) => {
+    if (role.guild?.id && role.guild.id !== cfg.discord.guildId) return;
+    try { await handleRoleCreate(ctx, role); }
+    catch (e) { log.error(`roleCreate error for ${role.name}:`, e); }
+  });
+  client.on('roleUpdate', async (oldRole, newRole) => {
+    if (newRole.guild?.id && newRole.guild.id !== cfg.discord.guildId) return;
+    try { await handleRoleUpdate(ctx, oldRole, newRole); }
+    catch (e) { log.error(`roleUpdate error for ${newRole.name}:`, e); }
+  });
+  client.on('roleDelete', async (role) => {
+    if (role.guild?.id && role.guild.id !== cfg.discord.guildId) return;
+    try { await handleRoleDelete(ctx, role); }
+    catch (e) { log.error(`roleDelete error for ${role.name}:`, e); }
+  });
+  client.on('guildMemberUpdate', async (oldMember, newMember) => {
+    if (newMember.guild?.id && newMember.guild.id !== cfg.discord.guildId) return;
+    try { await handleMemberUpdate(ctx, oldMember, newMember); }
+    catch (e) { log.error(`guildMemberUpdate error for ${newMember.user?.tag || newMember.id}:`, e); }
+  });
   client.on('error', (e) => log.error('client error', e));
   client.on('warn', (m) => log.warn(m));
 

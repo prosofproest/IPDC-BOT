@@ -6,6 +6,7 @@ import { makeActor } from '../core/auth.js';
 import { say } from '../core/router.js';
 import { button, embed, row, errEmbed, okEmbed } from '../ui.js';
 import { BRAND } from '../config/constants.js';
+import { provisionPmWorkspace } from '../core/workspace.js';
 
 const log = createLogger('requests');
 
@@ -154,6 +155,13 @@ export function register(router, ctx) {
       await audit.log({ action: 'roles.apply.queued', level: 'warn', actorId: i.user.id, targetId: req.userId, details: { requestId: id, error: e.message } });
     }
     await finalize(req, i.user.id, 'approved');
+    if (req.type === 'pm_application') {
+      const pm = await state.pmByUser(req.userId);
+      if (pm) {
+        try { await provisionPmWorkspace(ctx, pm.id, { welcome: true, auditActorId: i.user.id }); }
+        catch (e) { log.warn(`workspace provisioning deferred on approval: ${e.message}`); }
+      }
+    }
     await audit.log({ action: `request.approved.${req.type}`, actorId: i.user.id, targetId: req.userId, details: { requestId: id, rolesApplied: rolesOk } });
     await notifyUser(req.userId, okEmbed(`Your ${REQUEST_TYPES[req.type].label.toLowerCase()} was approved.${rolesOk ? '' : ' Your roles are being applied and will appear shortly.'}`, 'Request Approved'));
     return i.editReply({ embeds: [okEmbed(rolesOk ? 'Approved. Roles and access have been applied.' : 'Approved. Role assignment hit an error and was queued for automatic retry.')] });

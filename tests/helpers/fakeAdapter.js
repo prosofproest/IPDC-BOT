@@ -14,7 +14,10 @@ export class FakeAdapter {
   async getRole(id) { return this.roles.get(id) || null; }
   async findRole(name) { return [...this.roles.values()].find((r) => r.name.toLowerCase() === name.toLowerCase()) || null; }
   async createRole({ name }) { this.calls.createRole++; const r = { id: this.id(), name }; this.roles.set(r.id, r); return r; }
+  async deleteRole(id) { return this.roles.delete(id); }
+  async renameRole(id, name) { const r = this.roles.get(id); if (r) { r.name = name; return true; } return false; }
   async getChannel(id) { return this.channels.get(id) || null; }
+  async deleteChannel(id) { return this.channels.delete(id); }
   async findChannel({ kind, name, parentId }) {
     const norm = (n) => (kind === 'voice' || kind === 'category' ? n.toLowerCase() : slugify(n));
     return [...this.channels.values()].find((c) => c.kind === kind && (c.parentId ?? null) === (parentId ?? null) && norm(c.name) === norm(name)) || null;

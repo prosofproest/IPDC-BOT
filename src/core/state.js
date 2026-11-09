@@ -29,11 +29,37 @@ export class State {
   // ---- team roles ----
   async teams() { return (await this.store.list('teams')).filter((t) => t.status !== 'removed'); }
   async getTeam(id) { return this.store.get('teams', id); }
-  async createTeam({ name }) {
-    const teams = await this.teams(); const slug = slugify(name);
-    if (teams.some((t) => t.slug === slug)) throw new Error(`A team role named "${name}" already exists.`);
-    const t = { id: newId(), name: name.trim(), slug, status: 'active', createdAt: Date.now() };
-    await this.store.set('teams', t.id, t); return t;
+  async teamByRole(roleId) {
+    if (!roleId) return null;
+    return (await this.teams()).find((t) => t.roleId === roleId) || null;
+  }
+  async teamBySlug(slug) {
+    if (!slug) return null;
+    return (await this.teams()).find((t) => t.slug === slug) || null;
+  }
+  async teamByName(name) {
+    if (!name) return null;
+    const n = name.trim().toLowerCase();
+    const s = slugify(name);
+    return (await this.teams()).find((t) => t.name.toLowerCase() === n || t.slug === s) || null;
+  }
+  async createTeam({ name, roleId = null, slug = null }) {
+    const teams = await this.teams();
+    const finalSlug = slug || slugify(name);
+    const existing = teams.find((t) => t.slug === finalSlug || (roleId && t.roleId === roleId));
+    if (existing) {
+      if (roleId && !existing.roleId) {
+        await this.store.merge('teams', existing.id, { roleId });
+        return this.getTeam(existing.id);
+      }
+      if (roleId && existing.roleId === roleId) {
+        return existing;
+      }
+      throw new Error(`A team role named "${name}" already exists.`);
+    }
+    const t = { id: newId(), name: name.trim(), slug: finalSlug, roleId: roleId || null, status: 'active', createdAt: Date.now() };
+    await this.store.set('teams', t.id, t);
+    return t;
   }
   async updateTeam(id, patch) { await this.store.merge('teams', id, patch); return this.getTeam(id); }
 

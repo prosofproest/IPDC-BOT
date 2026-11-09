@@ -6,6 +6,7 @@ import { BRAND } from '../config/constants.js';
 import { bar, button, embed, row } from '../ui.js';
 import { Activity } from './activity.js';
 import { renderHeatmaps } from './render.js';
+import { pmGithubActivityIntroPayload } from '../core/workspace.js';
 
 const log = createLogger('monitoring');
 const DAY = 86400000;
@@ -97,7 +98,20 @@ export class Monitoring {
   async pmActivityPayload(pm, data, members, aiLine) {
     const s = Activity.summarize(data);
     const rep = this.reportStatus.get(pm.id) || (await this.c.store.get('reportStatus', pm.id));
-    if (!s.ok) return { embeds: [embed({ title: `GITHUB ACTIVITY — ${pm.name}`, description: `Monitoring is not active: ${s.error}.\nThe Project Manager can set the repository from the PM Control Panel.` })] };
+    if (!s.ok) {
+      if (!pm.repo) return pmGithubActivityIntroPayload(pm, this.c.cfg?.github);
+      return {
+        embeds: [embed({
+          title: `GITHUB ACTIVITY — ${pm.name}`,
+          color: BRAND.color,
+          description: `Repository: [${pm.repo.owner}/${pm.repo.name}](${pm.repo.url || `https://github.com/${pm.repo.owner}/${pm.repo.name}`})\n\n⚠️ Activity collection status: **${s.error}**\n\n` +
+            '• The bot attempted to collect commits and PRs for this repository.\n' +
+            '• Ensure the IPDC GitHub App has read permissions (Contents, Metadata, Pull Requests) on this repository.\n' +
+            '• Refreshed daily at 9:00 PM IST or manually by clicking **REFRESH ACTIVITY** in the PM Control Panel.',
+          footer: NOTE,
+        })],
+      };
+    }
     const top = [...s.perMember.values()].sort((a, b) => b.commits7 - a.commits7).slice(0, 8)
       .map((m) => `${m.userId ? `<@${m.userId}>` : m.login} — ${m.commits7} (7d)`);
     const recent = data.commits.slice(0, 6).map((c) => `[\`${c.sha.slice(0, 7)}\`](${c.url}) ${truncate(c.message, 70)}`);

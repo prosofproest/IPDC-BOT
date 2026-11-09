@@ -5,6 +5,7 @@ import { KEYS } from '../core/structure.js';
 import { makeActor } from '../core/auth.js';
 import { say } from '../core/router.js';
 import { button, embed, errEmbed, okEmbed, row } from '../ui.js';
+import { provisionPmWorkspace, auditPmPermissions } from '../core/workspace.js';
 
 const log = createLogger('admin');
 
@@ -76,9 +77,34 @@ export function register(router, ctx) {
   guarded('button', 'adm:pm', async (i) => {
     const pms = await state.pms();
     const teams = await state.teams(); const tn = new Map(teams.map((t) => [t.id, t.name]));
-    const list = pms.map((p) => `**${p.name}** — <@${p.discordUserId}>\nTeams: ${(p.teamIds || []).map((t) => tn.get(t)).filter(Boolean).join(', ') || 'none'}\nRepository: ${p.repo ? `${p.repo.owner}/${p.repo.name}` : 'not set'}`).join('\n\n') || 'No Project Managers configured yet.';
-    await say(i, { embeds: [embed({ title: 'PM MANAGEMENT', description: truncate(list, 3800) })],
-      components: [row(button('adm:pm-add', 'ADD PM', ButtonStyle.Primary), button('adm:pm-ren', 'RENAME PM'), button('adm:pm-del', 'REMOVE PM', ButtonStyle.Danger))] });
+    const list = (await Promise.all(pms.map(async (p) => {
+      const pmRoleId = await reconciler.getObjectId(KEYS.pmRole(p.id));
+      const controlId = await reconciler.getObjectId(KEYS.pmControl(p.id));
+      const updatesId = await reconciler.getObjectId(KEYS.pmUpdates(p.id));
+      const actId = await reconciler.getObjectId(KEYS.pmActivity(p.id));
+      const mappedTeams = (p.teamIds || []).map((tid) => tn.get(tid)).filter(Boolean);
+      const resForums = await Promise.all((p.teamIds || []).map(async (tid) => {
+        const fid = await reconciler.getObjectId(KEYS.resourceForum(tid));
+        return fid ? `<#${fid}>` : null;
+      }));
+      return [
+        `**${p.name}** [Status: \`${p.provisioningStatus || 'active'}\`]`,
+        `• Discord User: <@${p.discordUserId}> (\`${p.discordUserId}\`)`,
+        `• Personal Role: ${pmRoleId ? `<@&${pmRoleId}>` : 'Role pending'}`,
+        `• Assigned Team(s): ${mappedTeams.join(', ') || 'None assigned yet'}`,
+        `• Workspace Channels: ${controlId ? `<#${controlId}>` : 'pending'} · ${updatesId ? `<#${updatesId}>` : 'pending'} · ${actId ? `<#${actId}>` : 'pending'}`,
+        `• Resource Forums: ${resForums.filter(Boolean).join(', ') || 'No resources accessible'}`,
+        `• Repository: ${p.repo ? `[${p.repo.owner}/${p.repo.name}](${p.repo.url})` : 'not set'}`,
+      ].join('\n');
+    }))).join('\n\n') || 'No Project Managers configured yet.';
+
+    await say(i, {
+      embeds: [embed({ title: 'PM MANAGEMENT & WORKSPACE PROVISIONING', description: truncate(list, 3800) })],
+      components: [
+        row(button('adm:pm-add', 'ADD PM', ButtonStyle.Primary), button('adm:pm-prov', 'PROVISION / SYNC PM', ButtonStyle.Success), button('adm:pm-verify', 'VERIFY PERMISSIONS')),
+        row(button('adm:pm-ren', 'RENAME PM'), button('adm:pm-del', 'REMOVE PM', ButtonStyle.Danger)),
+      ],
+    });
   });
   guarded('button', 'adm:pm-add', (i) => say(i, { content: 'Select the Discord member who will be the Project Manager.', components: [row(new UserSelectMenuBuilder().setCustomId('adm:pm-add-user').setPlaceholder('Select the PM'))] }));
   guarded('select', 'adm:pm-add-user', (i) => i.showModal(modal(`adm:pm-add-name:${i.values[0]}`, 'New Project Manager', input('name', 'PM name (used as the category name)', { max: 40 }))));
@@ -89,13 +115,54 @@ export function register(router, ctx) {
       await sync('pm-created');
       let note = '';
       try {
-        const r = await ctx.roles.memberRoleKeys({ pmId: pm.id });
-        await ctx.roles.apply(uid, { add: [r.ipdc, r.pm] }, 'IPDC PM created by admin');
+        await provisionPmWorkspace(ctx, pm.id, { welcome: true, auditActorId: i.user.id });
         await state.saveMember(uid, { id: uid, status: 'approved', role: 'pm', pmId: pm.id, approvedAt: Date.now() });
-      } catch (e) { note = `\nRoles could not be assigned yet (${e.message}). Run structure repair after the member joins.`; }
+      } catch (e) { note = `\nWorkspace auto-provisioning note: ${e.message}`; }
       await audit.log({ action: 'pm.created', actorId: i.user.id, targetId: uid, details: { pmId: pm.id, name: pm.name } });
-      await say(i, { embeds: [okEmbed(`PM **${pm.name}** created with category, control, updates, activity and voice channels.${note}\nNext: map team roles to this PM.`)] });
+      await say(i, { embeds: [okEmbed(`PM **${pm.name}** created and workspace provisioned with personal role, control, updates, activity, and voice channels.${note}\nNext: use **Role-to-PM Mapping** to assign team roles.`)] });
     } catch (e) { await say(i, { embeds: [errEmbed(e.message)] }); }
+  });
+
+  guarded('button', 'adm:pm-prov', (i) => pmPicker(i, 'adm:pm-prov-sel', 'Select a PM to provision/synchronize their workspace, roles, and introduction channels.'));
+  guarded('select', 'adm:pm-prov-sel', async (i) => {
+    await i.deferReply({ flags: 64 });
+    const pmId = i.values[0];
+    try {
+      const res = await provisionPmWorkspace(ctx, pmId, { welcome: true, auditActorId: i.user.id });
+      await say(i, { embeds: [okEmbed(
+        `PM Workspace successfully synchronized for **${res.pm.name}**.\n\n` +
+        `• **Personal Role**: ${res.pm.roleId ? `<@&${res.pm.roleId}>` : 'Created'}\n` +
+        `• **Assigned Teams**: ${res.resources.map((r) => r.name).join(', ') || 'None'}\n` +
+        `• **Roles Added**: ${res.rolesAdded.length ? res.rolesAdded.map((r) => `<@&${r}>`).join(', ') : 'None'}\n` +
+        `• **Roles Removed**: ${res.rolesRemoved.length ? res.rolesRemoved.map((r) => `<@&${r}>`).join(', ') : 'None'}\n` +
+        `• **Channels Configured**: <#${res.channels.control}>, <#${res.channels.updates}>, <#${res.channels.activity}>\n` +
+        `• **Resource Forums Accessible**: ${res.resources.map((r) => `<#${r.forumId}>`).join(', ') || 'None'}\n\n` +
+        `Introduction messages have been populated in all channels.`,
+        'Provisioning Complete'
+      )] });
+    } catch (e) {
+      await say(i, { embeds: [errEmbed(`Provisioning failed: ${e.message}`)] });
+    }
+  });
+
+  guarded('button', 'adm:pm-verify', (i) => pmPicker(i, 'adm:pm-verify-sel', 'Select a PM to audit their Discord channel and resource permissions.'));
+  guarded('select', 'adm:pm-verify-sel', async (i) => {
+    await i.deferReply({ flags: 64 });
+    const pmId = i.values[0];
+    const pm = await state.getPm(pmId);
+    if (!pm) return say(i, { embeds: [errEmbed('PM not found.')] });
+    try {
+      const report = await auditPmPermissions(ctx, pmId);
+      const lines = report.checks.map((c) => `${c.pass ? '✅' : '❌'} **${c.name}**: Expected \`${c.expected}\`, Actual \`${c.actual}\``);
+      await say(i, { embeds: [embed({
+        title: `PERMISSION VERIFICATION AUDIT — ${pm.name.toUpperCase()}`,
+        color: report.pass ? BRAND.accent : 0xcf222e,
+        description: `Overall Verification: **${report.pass ? 'ALL CHECKS PASSED ✅' : 'CHECKS FAILED ❌'}**\n\n` + lines.join('\n'),
+        footer: 'Evaluates real category, channel, and role permission overwrites in Discord',
+      })] });
+    } catch (e) {
+      await say(i, { embeds: [errEmbed(`Audit failed: ${e.message}`)] });
+    }
   });
 
   const pmPicker = async (i, id, ph) => {
@@ -186,12 +253,34 @@ export function register(router, ctx) {
     await i.update({ content: `Team roles for **${pm.name}**. Select all that apply, then the channels are created automatically.`, components: [row(new StringSelectMenuBuilder().setCustomId(`adm:map-set:${pm.id}`).setPlaceholder('Select team roles').setMinValues(0).setMaxValues(opts.length).addOptions(opts))] });
   });
   guarded('select', 'adm:map-set', async (i, [pmId]) => {
-    await i.deferUpdate(); const pm = await state.getPm(pmId); const before = pm.teamIds || [];
+    await i.deferUpdate();
+    const pm = await state.getPm(pmId);
+    const before = pm.teamIds || [];
     await state.updatePm(pmId, { teamIds: i.values });
-    const r = await sync('mapping-updated');
+    let prov = { rolesAdded: [], rolesRemoved: [], resources: [] };
+    try {
+      prov = await provisionPmWorkspace(ctx, pmId, { welcome: false, auditActorId: i.user.id });
+    } catch (e) {
+      log.warn(`workspace sync on mapping change failed: ${e.message}`);
+      await sync('mapping-updated');
+    }
     const dropped = before.filter((t) => !i.values.includes(t));
-    await audit.log({ action: 'pm.mapping_updated', actorId: i.user.id, details: { pmId, teamIds: i.values, dropped } });
-    await i.editReply({ content: null, embeds: [okEmbed(`Mapping saved for **${pm.name}**. Created ${r.created || 0} new object(s).${dropped.length ? `\n${dropped.length} previously mapped team channel(s) were kept; remove them via Cleanup if no longer needed.` : ''}`)], components: [] });
+    const added = i.values.filter((t) => !before.includes(t));
+    await audit.log({ action: 'pm.mapping_updated', actorId: i.user.id, details: { pmId, teamIds: i.values, dropped, added } });
+    await i.editReply({
+      content: null,
+      embeds: [okEmbed(
+        `Role-to-PM Mapping successfully updated for **${pm.name}**.\n\n` +
+        `• **Assigned Teams**: ${prov.resources?.length ? prov.resources.map((r) => r.name).join(', ') : 'None'}\n` +
+        `• **Discord Roles Added**: ${prov.rolesAdded?.length ? prov.rolesAdded.map((r) => `<@&${r}>`).join(', ') : 'None'}\n` +
+        `• **Discord Roles Removed**: ${prov.rolesRemoved?.length ? prov.rolesRemoved.map((r) => `<@&${r}>`).join(', ') : 'None'}\n` +
+        `• **Resource Forums Accessible**: ${prov.resources?.length ? prov.resources.map((r) => `<#${r.forumId}>`).join(', ') : 'None'}\n\n` +
+        `Team text channels and resource visibility have been synchronized.` +
+        (dropped.length ? `\n\n*Note: ${dropped.length} previously created team text channel(s) were preserved; delete via Cleanup if no longer needed.*` : ''),
+        'Mapping Synchronized'
+      )],
+      components: [],
+    });
   });
 
   // ---------- applications ----------

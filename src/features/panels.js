@@ -5,6 +5,7 @@ import { adminPanelPayload } from './admin.js';
 import { pmPanelPayload } from './pm.js';
 import { supportPanelPayload } from './support.js';
 import { welcomeEntryPayload } from './onboarding.js';
+import { provisionPmWorkspace } from '../core/workspace.js';
 
 const log = createLogger('panels');
 const placeholder = (title) => ({ embeds: [embed({ title, description: 'Awaiting the first scheduled update. This message is edited in place daily at 9:00 PM IST.' })] });
@@ -18,12 +19,19 @@ export class Panels {
     await messages.ensure('panel:welcome', 'ch:welcome', welcomeEntryPayload());
     await messages.ensure('panel:support', 'ch:support-center', supportPanelPayload(s.supportCategories));
     await messages.ensure('panel:admin', 'ch:admin-panel', adminPanelPayload());
-    for (const pm of await state.pms()) await messages.ensure(`pm:${pm.id}:panel`, KEYS.pmControl(pm.id), pmPanelPayload(pm));
+    for (const pm of await state.pms()) {
+      try {
+        await provisionPmWorkspace(this.ctx, pm.id, { welcome: false });
+      } catch (e) {
+        log.warn(`workspace auto-provision for ${pm.name} failed: ${e.message}`);
+        await messages.ensure(`pm:${pm.id}:panel`, KEYS.pmControl(pm.id), pmPanelPayload(pm));
+        await messages.ensure(`pm:${pm.id}:dash`, KEYS.pmActivity(pm.id), placeholder(`GITHUB ACTIVITY — ${pm.name}`), { refresh: false });
+      }
+    }
     // dashboards: created once as placeholders, then edited by the monitoring job
     const ph = [['dash:heatmap', 'ch:github-contributions', 'GITHUB CONTRIBUTION HEATMAPS'], ['dash:leaderboard', 'ch:contribution-leaderboard', 'CONTRIBUTION LEADERBOARD'],
       ['dash:server-activity', 'ch:server-activity', 'SERVER ACTIVITY'], ['dash:challenges', 'ch:github-challenges', 'GITHUB CHALLENGES'], ['dash:monitoring:0', 'ch:server-monitoring', 'SERVER MONITORING']];
     for (const [k, ch, t] of ph) await messages.ensure(k, ch, placeholder(t), { refresh: false });
-    for (const pm of await state.pms()) await messages.ensure(`pm:${pm.id}:dash`, KEYS.pmActivity(pm.id), placeholder(`GITHUB ACTIVITY — ${pm.name}`), { refresh: false });
     log.info('panels ensured');
   }
 
