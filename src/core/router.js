@@ -31,7 +31,17 @@ export class Router {
     } catch (e) {
       log.error(`interaction failed (${i.customId || i.commandName})`, e);
       const msg = { content: 'Something went wrong while handling that action. The incident was logged. Please try again or open a support ticket.', flags: MessageFlags.Ephemeral };
-      try { if (i.deferred || i.replied) await i.followUp(msg); else await i.reply(msg); } catch { /* interaction expired */ }
+      try {
+        if (i.deferred && !i.replied) {
+          await i.editReply(msg);
+          i.replied = true;
+        } else if (i.replied || i.deferred) {
+          await i.followUp(msg);
+        } else {
+          await i.reply(msg);
+          i.replied = true;
+        }
+      } catch { /* interaction expired */ }
     }
   }
 }
@@ -40,7 +50,13 @@ export class Router {
 export async function say(i, content, extra = {}) {
   const payload = typeof content === 'string' ? { content, ...extra } : { ...content, ...extra };
   payload.flags = MessageFlags.Ephemeral;
-  if (i.deferred && !i.replied) return i.editReply({ ...payload, flags: undefined });
+  if (i.deferred && !i.replied) {
+    const res = await i.editReply({ ...payload, flags: undefined });
+    i.replied = true;
+    return res;
+  }
   if (i.replied || i.deferred) return i.followUp(payload);
-  return i.reply(payload);
+  const res = await i.reply(payload);
+  i.replied = true;
+  return res;
 }

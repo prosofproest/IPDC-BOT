@@ -33,8 +33,7 @@ export class Auth {
   async can(action, actor, ctx = {}) {
     if (action === 'assign.grid' || action === 'assign.admin') return false; // never by the bot
     if (this.isGrid(actor)) return true;
-    const settings = await this.getSettings();
-    const adminGranted = this.isAdminRole(actor) && (settings.adminGrants || []).includes(action);
+    const adminGranted = this.isAdminRole(actor) && ((await this.getSettings()).adminGrants || []).includes(action);
     switch (action) {
       case 'admin.panel':
       case 'monitoring.view':

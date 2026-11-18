@@ -75,16 +75,21 @@ export function register(router, ctx) {
 
   // ---------- PM management ----------
   guarded('button', 'adm:pm', async (i) => {
-    const pms = await state.pms();
-    const teams = await state.teams(); const tn = new Map(teams.map((t) => [t.id, t.name]));
+    if (!i.deferred && !i.replied) await i.deferReply({ flags: 64 });
+    const [pms, teams, registry] = await Promise.all([
+      state.pms(),
+      state.teams(),
+      reconciler.loadRegistry ? reconciler.loadRegistry() : null,
+    ]);
+    const tn = new Map(teams.map((t) => [t.id, t.name]));
     const list = (await Promise.all(pms.map(async (p) => {
-      const pmRoleId = await reconciler.getObjectId(KEYS.pmRole(p.id));
-      const controlId = await reconciler.getObjectId(KEYS.pmControl(p.id));
-      const updatesId = await reconciler.getObjectId(KEYS.pmUpdates(p.id));
-      const actId = await reconciler.getObjectId(KEYS.pmActivity(p.id));
+      const pmRoleId = registry ? registry.get(KEYS.pmRole(p.id))?.id : await reconciler.getObjectId(KEYS.pmRole(p.id));
+      const controlId = registry ? registry.get(KEYS.pmControl(p.id))?.id : await reconciler.getObjectId(KEYS.pmControl(p.id));
+      const updatesId = registry ? registry.get(KEYS.pmUpdates(p.id))?.id : await reconciler.getObjectId(KEYS.pmUpdates(p.id));
+      const actId = registry ? registry.get(KEYS.pmActivity(p.id))?.id : await reconciler.getObjectId(KEYS.pmActivity(p.id));
       const mappedTeams = (p.teamIds || []).map((tid) => tn.get(tid)).filter(Boolean);
       const resForums = await Promise.all((p.teamIds || []).map(async (tid) => {
-        const fid = await reconciler.getObjectId(KEYS.resourceForum(tid));
+        const fid = registry ? registry.get(KEYS.resourceForum(tid))?.id : await reconciler.getObjectId(KEYS.resourceForum(tid));
         return fid ? `<#${fid}>` : null;
       }));
       return [
@@ -166,6 +171,7 @@ export function register(router, ctx) {
   });
 
   const pmPicker = async (i, id, ph) => {
+    if (!i.deferred && !i.replied) await i.deferReply({ flags: 64 });
     const pms = await state.pms(); if (!pms.length) return say(i, 'No PMs configured.');
     return say(i, { content: ph, components: [row(menu(id, 'Select a PM', pms.map((p) => ({ label: p.name.slice(0, 100), value: p.id }))))] });
   };
@@ -185,10 +191,12 @@ export function register(router, ctx) {
   guarded('button', 'adm:pm-del', (i) => pmPicker(i, 'adm:pm-del-sel', 'Which PM do you want to remove? You will be asked to confirm.'));
   guarded('select', 'adm:pm-del-sel', async (i) => {
     const pm = await state.getPm(i.values[0]);
+    if (!pm) return say(i, { embeds: [errEmbed('PM not found.')] });
     await i.update({ content: null, embeds: [errEmbed(`Removing **${pm.name}** permanently deletes the PM role, category, control/updates/activity channels, team channels and voice channels. Member records are kept but unassigned. This cannot be undone.`, 'Confirm Destructive Action')], components: [row(button(`adm:pm-del-ok:${pm.id}`, 'PERMANENTLY REMOVE', ButtonStyle.Danger))] });
   });
   guarded('button', 'adm:pm-del-ok', async (i, [id]) => {
-    await i.deferUpdate(); const pm = await state.getPm(id); if (!pm) return;
+    await i.deferUpdate(); const pm = await state.getPm(id);
+    if (!pm) { await i.editReply({ embeds: [errEmbed('PM not found.')], components: [] }); return; }
     const n = await managed.deleteWhere((k) => k.startsWith(`pm:${id}:`) || k.startsWith(`msg:pm:${id}:`), `IPDC admin removed PM ${pm.name}`);
     await state.updatePm(id, { status: 'removed', removedAt: Date.now() });
     for (const m of (await state.members()).filter((x) => x.pmId === id)) await state.saveMember(m.id, { pmId: null, teamId: null, status: 'unassigned' });
@@ -198,6 +206,7 @@ export function register(router, ctx) {
 
   // ---------- team roles ----------
   guarded('button', 'adm:team', async (i) => {
+    if (!i.deferred && !i.replied) await i.deferReply({ flags: 64 });
     const teams = await state.teams();
     await say(i, { embeds: [embed({ title: 'TEAM ROLES', description: teams.map((t) => `**${t.name}** — resource forum + role`).join('\n') || 'No team roles configured yet.' })],
       components: [row(button('adm:team-add', 'ADD TEAM ROLE', ButtonStyle.Primary), button('adm:team-ren', 'RENAME'), button('adm:team-del', 'REMOVE', ButtonStyle.Danger))] });
@@ -213,6 +222,7 @@ export function register(router, ctx) {
     } catch (e) { await say(i, { embeds: [errEmbed(e.message)] }); }
   });
   const teamPicker = async (i, id, ph) => {
+    if (!i.deferred && !i.replied) await i.deferReply({ flags: 64 });
     const teams = await state.teams(); if (!teams.length) return say(i, 'No team roles configured.');
     return say(i, { content: ph, components: [row(menu(id, 'Select a team role', teams.map((t) => ({ label: t.name.slice(0, 100), value: t.id }))))] });
   };
@@ -232,10 +242,12 @@ export function register(router, ctx) {
   guarded('button', 'adm:team-del', (i) => teamPicker(i, 'adm:team-del-sel', 'Which team role do you want to remove? You will be asked to confirm.'));
   guarded('select', 'adm:team-del-sel', async (i) => {
     const t = await state.getTeam(i.values[0]);
+    if (!t) return say(i, { embeds: [errEmbed('Team role not found.')] });
     await i.update({ content: null, embeds: [errEmbed(`Removing **${t.name}** permanently deletes the role, resource forum (with its posts) and all PM team channels for it. This cannot be undone.`, 'Confirm Destructive Action')], components: [row(button(`adm:team-del-ok:${t.id}`, 'PERMANENTLY REMOVE', ButtonStyle.Danger))] });
   });
   guarded('button', 'adm:team-del-ok', async (i, [id]) => {
-    await i.deferUpdate(); const t = await state.getTeam(id); if (!t) return;
+    await i.deferUpdate(); const t = await state.getTeam(id);
+    if (!t) { await i.editReply({ embeds: [errEmbed('Team role not found.')], components: [] }); return; }
     const n = await managed.deleteWhere((k) => k === KEYS.teamRole(id) || k === KEYS.resourceForum(id) || (k.startsWith('pm:') && k.endsWith(`:team:${id}:text`)), `IPDC admin removed team ${t.name}`);
     await state.updateTeam(id, { status: 'removed', removedAt: Date.now() });
     for (const pm of await state.pms()) if ((pm.teamIds || []).includes(id)) await state.updatePm(pm.id, { teamIds: pm.teamIds.filter((x) => x !== id) });
@@ -248,6 +260,7 @@ export function register(router, ctx) {
   guarded('button', 'adm:map', (i) => pmPicker(i, 'adm:map-pm', 'Select a PM to edit which team roles belong to their team.'));
   guarded('select', 'adm:map-pm', async (i) => {
     const pm = await state.getPm(i.values[0]); const teams = await state.teams();
+    if (!pm) return say(i, { embeds: [errEmbed('PM not found.')] });
     if (!teams.length) return i.update({ content: 'Create team roles first.', components: [] });
     const opts = teams.slice(0, 25).map((t) => ({ label: t.name.slice(0, 100), value: t.id, default: (pm.teamIds || []).includes(t.id) }));
     await i.update({ content: `Team roles for **${pm.name}**. Select all that apply, then the channels are created automatically.`, components: [row(new StringSelectMenuBuilder().setCustomId(`adm:map-set:${pm.id}`).setPlaceholder('Select team roles').setMinValues(0).setMaxValues(opts.length).addOptions(opts))] });
@@ -255,6 +268,7 @@ export function register(router, ctx) {
   guarded('select', 'adm:map-set', async (i, [pmId]) => {
     await i.deferUpdate();
     const pm = await state.getPm(pmId);
+    if (!pm) { await i.editReply({ embeds: [errEmbed('PM not found.')], components: [] }); return; }
     const before = pm.teamIds || [];
     await state.updatePm(pmId, { teamIds: i.values });
     let prov = { rolesAdded: [], rolesRemoved: [], resources: [] };
@@ -285,6 +299,7 @@ export function register(router, ctx) {
 
   // ---------- applications ----------
   guarded('button', 'adm:appr', async (i) => {
+    if (!i.deferred && !i.replied) await i.deferReply({ flags: 64 });
     const pending = (await store.list('requests')).filter((r) => r.status === 'pending').sort((a, b) => a.createdAt - b.createdAt);
     const g = cfg.discord.guildId;
     const lines = pending.slice(0, 20).map((r) => `• ${r.type.replace('_', ' ')} — <@${r.userId}> — [open](https://discord.com/channels/${g}/${r.ref?.channelId}/${r.ref?.messageId})`);
@@ -293,8 +308,16 @@ export function register(router, ctx) {
 
   // ---------- resources ----------
   guarded('button', 'adm:res', async (i) => {
-    const teams = await state.teams(); const lines = [];
-    for (const t of teams) { const id = await reconciler.getObjectId(KEYS.resourceForum(t.id)); lines.push(`**${t.name}** — ${id ? `<#${id}>` : 'forum missing (run Repair Structure)'}`); }
+    if (!i.deferred && !i.replied) await i.deferReply({ flags: 64 });
+    const [teams, registry] = await Promise.all([
+      state.teams(),
+      reconciler.loadRegistry ? reconciler.loadRegistry() : null,
+    ]);
+    const lines = [];
+    for (const t of teams) {
+      const id = registry ? registry.get(KEYS.resourceForum(t.id))?.id : await reconciler.getObjectId(KEYS.resourceForum(t.id));
+      lines.push(`**${t.name}** — ${id ? `<#${id}>` : 'forum missing (run Repair Structure)'}`);
+    }
     await say(i, { embeds: [embed({ title: 'RESOURCE FORUMS', description: lines.join('\n') || 'No team roles yet.' })], components: teams.length ? [row(button('adm:res-post', 'POST A RESOURCE', ButtonStyle.Primary))] : [] });
   });
   guarded('button', 'adm:res-post', (i) => teamPicker(i, 'adm:res-team', 'Which team forum should receive the resource?'));
