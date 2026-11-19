@@ -6,6 +6,7 @@ import { say } from '../core/router.js';
 import { button, embed, errEmbed, okEmbed, row } from '../ui.js';
 import { BRAND } from '../config/constants.js';
 import { provisionPmWorkspace } from '../core/workspace.js';
+import { getValidActiveTeams } from '../core/dynamicRoles.js';
 
 const log = createLogger('pm');
 
@@ -78,13 +79,75 @@ export function register(router, ctx) {
     await say(i, { embeds: [okEmbed(`Monitoring **${info.fullName}**. The team activity dashboard will refresh shortly.`, 'Repository Updated')] });
   });
 
-  router.button('pm:team', async (i, [pmId]) => {
+  router.button('pm:team', async (i, [pmId, pageStr]) => {
     if (!(await panelOk(i, pmId))) return say(i, { embeds: [errEmbed('Not authorized.')] });
-    const [pm, teams, members] = await Promise.all([state.getPm(pmId), state.teams(), state.membersOfPm(pmId)]);
-    const byTeam = new Map(teams.map((t) => [t.id, []]));
-    for (const m of members) (byTeam.get(m.teamId) || byTeam.set(m.teamId, []).get(m.teamId)).push(m);
-    const lines = [...byTeam.entries()].filter(([, v]) => v.length).map(([tid, v]) => `**${teams.find((t) => t.id === tid)?.name || 'Unassigned'}** (${v.length})\n${v.map((m) => `<@${m.id}>${m.github?.username ? ` — [${m.github.username}](https://github.com/${m.github.username})` : ''}`).join('\n')}`);
-    await say(i, { embeds: [embed({ title: `TEAM OVERVIEW — ${pm.name}`, description: truncate(lines.join('\n\n') || 'No approved members yet.', 3900) })] });
+    const pm = await state.getPm(pmId);
+    if (!pm) return say(i, { embeds: [errEmbed('PM not found.')] });
+
+    const validTeams = await getValidActiveTeams(ctx);
+    if (!validTeams.length) {
+      const payload = { embeds: [embed({ title: `TEAM OVERVIEW — ${pm.name}`, description: 'No team roles configured yet.' })], components: [] };
+      if (pageStr && typeof i.update === 'function') return i.update(payload);
+      return say(i, payload);
+    }
+
+    const members = await state.membersOfPm(pmId);
+    const byTeam = new Map(validTeams.map((t) => [t.id, []]));
+    const unassigned = [];
+
+    for (const m of members) {
+      if (m.teamId && byTeam.has(m.teamId)) {
+        byTeam.get(m.teamId).push(m);
+      } else {
+        unassigned.push(m);
+      }
+    }
+
+    const PAGE_SIZE = 8;
+    const totalPages = Math.max(1, Math.ceil(validTeams.length / PAGE_SIZE));
+    const currentPage = Math.min(Math.max(1, parseInt(pageStr || '1', 10) || 1), totalPages);
+
+    const startIdx = (currentPage - 1) * PAGE_SIZE;
+    const pageTeams = validTeams.slice(startIdx, startIdx + PAGE_SIZE);
+
+    const lines = [];
+    for (const t of pageTeams) {
+      const tMembers = byTeam.get(t.id) || [];
+      if (tMembers.length > 0) {
+        const memberList = tMembers.map((m) => `<@${m.id}>${m.github?.username ? ` — [${m.github.username}](https://github.com/${m.github.username})` : ''}`).join('\n');
+        lines.push(`**${t.name}** (${tMembers.length})\n${memberList}`);
+      } else {
+        lines.push(`**${t.name}** (0)\n*No members assigned yet*`);
+      }
+    }
+
+    if (currentPage === totalPages && unassigned.length > 0) {
+      const unassignedList = unassigned.map((m) => `<@${m.id}>${m.github?.username ? ` — [${m.github.username}](https://github.com/${m.github.username})` : ''}`).join('\n');
+      lines.push(`**Unassigned** (${unassigned.length})\n${unassignedList}`);
+    }
+
+    const title = totalPages > 1
+      ? `TEAM OVERVIEW — ${pm.name} (Page ${currentPage} of ${totalPages})`
+      : `TEAM OVERVIEW — ${pm.name}`;
+
+    const components = [];
+    if (totalPages > 1) {
+      const prevBtn = button(`pm:team:${pm.id}:${currentPage - 1}`, '◀ PREV', ButtonStyle.Secondary);
+      if (currentPage <= 1) prevBtn.setDisabled(true);
+      const nextBtn = button(`pm:team:${pm.id}:${currentPage + 1}`, 'NEXT ▶', ButtonStyle.Secondary);
+      if (currentPage >= totalPages) nextBtn.setDisabled(true);
+      components.push(row(prevBtn, nextBtn));
+    }
+
+    const payload = {
+      embeds: [embed({ title, description: truncate(lines.join('\n\n') || 'No approved members yet.', 3900) })],
+      components,
+    };
+
+    if (pageStr && typeof i.update === 'function') {
+      return i.update(payload);
+    }
+    return say(i, payload);
   });
 
   router.button('pm:pending', async (i, [pmId]) => {
@@ -94,20 +157,76 @@ export function register(router, ctx) {
     await say(i, { embeds: [embed({ title: 'PENDING REQUESTS', description: pending.map((r) => `• ${r.type.replace('_', ' ')} — <@${r.userId}> — [open](https://discord.com/channels/${g}/${r.ref?.channelId}/${r.ref?.messageId}) (${fmtIST(r.createdAt)})`).join('\n') || 'No pending requests.' })] });
   });
 
-  router.button('pm:manage-teams', async (i, [pmId]) => {
+  router.button('pm:manage-teams', async (i, [pmId, pageStr]) => {
     if (!(await panelOk(i, pmId))) return say(i, { embeds: [errEmbed('Not authorized.')] });
-    const [pm, teams] = await Promise.all([state.getPm(pmId), state.teams()]);
+    const pm = await state.getPm(pmId);
     if (!pm) return say(i, { embeds: [errEmbed('PM not found.')] });
-    if (!teams.length) return say(i, { embeds: [errEmbed('No team roles configured yet.')] });
-    const opts = teams.slice(0, 25).map((t) => ({
-      label: t.name.slice(0, 100),
-      value: t.id,
-      default: (pm.teamIds || []).includes(t.id),
-    }));
-    await say(i, {
-      content: `Select which team roles you manage for **${pm.name}**. Your PM category channels and resource access will update automatically.`,
-      components: [row(new StringSelectMenuBuilder().setCustomId(`pm:set-teams:${pm.id}`).setPlaceholder('Select assigned team roles').setMinValues(0).setMaxValues(opts.length).addOptions(opts))],
-    });
+
+    const validTeams = await getValidActiveTeams(ctx);
+    if (!validTeams.length) return say(i, { embeds: [errEmbed('No team roles configured yet.')] });
+
+    // Under Option B, active teams are authoritative: ensure pm.teamIds has all valid teams and prune obsolete
+    const validTeamIds = validTeams.map((t) => t.id);
+    const currentTeamIds = pm.teamIds || [];
+    const needsSync = validTeamIds.some((id) => !currentTeamIds.includes(id)) || currentTeamIds.some((id) => !validTeamIds.includes(id));
+    if (needsSync) {
+      await state.updatePm(pmId, { teamIds: validTeamIds });
+    }
+
+    // Discord limits:
+    // Max 5 ActionRows per message.
+    // Max 25 options per StringSelectMenu.
+    // If <= 100 teams: chunk into select menus of 25 options each (up to 4 rows).
+    // If > 100 teams: paginate across pages (4 select menu rows per page + 1 row for PREV/NEXT navigation).
+    const TEAMS_PER_PAGE = 100;
+    const totalPages = Math.max(1, Math.ceil(validTeams.length / TEAMS_PER_PAGE));
+    const currentPage = Math.min(Math.max(1, parseInt(pageStr || '1', 10) || 1), totalPages);
+
+    const startIdx = (currentPage - 1) * TEAMS_PER_PAGE;
+    const pageTeams = validTeams.slice(startIdx, startIdx + TEAMS_PER_PAGE);
+
+    const CHUNK_SIZE = 25;
+    const components = [];
+
+    for (let c = 0; c < pageTeams.length && components.length < 4; c += CHUNK_SIZE) {
+      const slice = pageTeams.slice(c, c + CHUNK_SIZE);
+      const rowIdx = components.length + 1;
+      const opts = slice.map((t) => ({
+        label: t.name.slice(0, 100),
+        value: t.id,
+        default: true,
+      }));
+      const rangeLabel = totalPages > 1
+        ? `Teams ${startIdx + c + 1}–${startIdx + c + slice.length}`
+        : slice.length > 25 ? `Teams ${c + 1}–${c + slice.length}` : 'Select assigned team roles';
+
+      components.push(
+        row(
+          new StringSelectMenuBuilder()
+            .setCustomId(`pm:set-teams:${pm.id}:${currentPage}:${rowIdx}`)
+            .setPlaceholder(rangeLabel)
+            .setMinValues(0)
+            .setMaxValues(opts.length)
+            .addOptions(opts)
+        )
+      );
+    }
+
+    if (totalPages > 1) {
+      const prevBtn = button(`pm:manage-teams:${pm.id}:${currentPage - 1}`, '◀ PREV', ButtonStyle.Secondary);
+      if (currentPage <= 1) prevBtn.setDisabled(true);
+      const nextBtn = button(`pm:manage-teams:${pm.id}:${currentPage + 1}`, 'NEXT ▶', ButtonStyle.Secondary);
+      if (currentPage >= totalPages) nextBtn.setDisabled(true);
+      components.push(row(prevBtn, nextBtn));
+    }
+
+    const content = `Active team roles for **${pm.name}** (Option B: All active team roles are globally assigned to your workspace). Use the menus below to review your assigned teams.${totalPages > 1 ? ` (Page ${currentPage} of ${totalPages})` : ''}`;
+
+    const payload = { content, components };
+    if (pageStr && typeof i.update === 'function') {
+      return i.update(payload);
+    }
+    return say(i, payload);
   });
 
   router.select('pm:set-teams', async (i, [pmId]) => {
@@ -115,24 +234,42 @@ export function register(router, ctx) {
     if (!(await panelOk(i, pmId))) return;
     const pm = await state.getPm(pmId);
     if (!pm) return;
-    const before = pm.teamIds || [];
-    await state.updatePm(pmId, { teamIds: i.values });
+
+    // Under Option B, all active teams are authoritative.
+    // Submitting the selector cannot remove active teams.
+    const validTeams = await getValidActiveTeams(ctx);
+    const validTeamIds = validTeams.map((t) => t.id);
+
+    await state.updatePm(pmId, { teamIds: validTeamIds });
+
     let prov = { rolesAdded: [], rolesRemoved: [], resources: [] };
     try {
       prov = await provisionPmWorkspace(ctx, pmId, { welcome: false, auditActorId: i.user.id });
     } catch (e) {
       log.warn(`workspace sync failed: ${e.message}`);
     }
-    const dropped = before.filter((t) => !i.values.includes(t));
-    const added = i.values.filter((t) => !before.includes(t));
-    await audit.log({ action: 'pm.teams_assigned', actorId: i.user.id, details: { pmId, teamIds: i.values, dropped, added } });
+
+    await audit.log({
+      action: 'pm.teams_assigned',
+      actorId: i.user.id,
+      details: { pmId, teamIds: validTeamIds },
+    });
+
+    const teamNames = prov.resources?.length ? prov.resources.map((r) => r.name) : validTeams.map((t) => t.name);
+    const activeTeamsSummary = teamNames.length > 15
+      ? `${teamNames.slice(0, 15).join(', ')} ... (+${teamNames.length - 15} more)`
+      : (teamNames.join(', ') || 'None');
+
     await i.editReply({
       content: null,
       embeds: [okEmbed(
-        `Assigned team roles updated for **${pm.name}**.\n\n` +
-        `• **Active Teams**: ${prov.resources?.length ? prov.resources.map((r) => r.name).join(', ') : 'None'}\n` +
-        `• **Channels Synchronized**: Team text channels and resource visibility have been updated.`,
-        'Teams Updated'
+        truncate(
+          `Assigned team roles updated for **${pm.name}**.\n\n` +
+          `• **Active Teams** (${validTeamIds.length} total): ${activeTeamsSummary}\n` +
+          `• **Channels Synchronized**: Team text channels and resource visibility remain synchronized.`,
+          3900
+        ),
+        'Teams Synchronized'
       )],
       components: [],
     });

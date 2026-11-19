@@ -106,10 +106,39 @@ export function pmOnboardingWelcomePayload(pm, { channels = {}, teams = [] } = {
 }
 
 // ---------------------------------------------------------------------------
-// 2. Idempotent PM Workspace Provisioner
+// 2. Idempotent PM Workspace Provisioner & Concurrency Lock
 // ---------------------------------------------------------------------------
 
-export async function provisionPmWorkspace(ctx, pmId, { welcome = true, auditActorId = null } = {}) {
+const _provisionLocks = new Map();
+
+export async function withProvisionLock(pmId, fn) {
+  while (_provisionLocks.has(pmId)) {
+    try {
+      await _provisionLocks.get(pmId);
+    } catch {
+      // Ignore errors from previous operation
+    }
+  }
+  let resolveLock;
+  const lockPromise = new Promise((resolve) => {
+    resolveLock = resolve;
+  });
+  _provisionLocks.set(pmId, lockPromise);
+  try {
+    return await fn();
+  } finally {
+    _provisionLocks.delete(pmId);
+    resolveLock();
+  }
+}
+
+export async function provisionPmWorkspace(ctx, pmId, options = {}) {
+  return withProvisionLock(pmId, async () => {
+    return _provisionPmWorkspaceInternal(ctx, pmId, options);
+  });
+}
+
+async function _provisionPmWorkspaceInternal(ctx, pmId, { welcome = true, auditActorId = null, syncGlobal } = {}) {
   const { state, store, reconciler, roles, client, cfg, audit } = ctx;
   const pm = await state.getPm(pmId);
   if (!pm || pm.status === 'removed') throw new Error(`Project Manager "${pmId}" not found or removed.`);
@@ -124,9 +153,29 @@ export async function provisionPmWorkspace(ctx, pmId, { welcome = true, auditAct
   }
 
   // 2. Resolve assigned teams and team roles
-  const allTeams = await state.teams();
-  const assignedTeamIds = pm.teamIds || [];
-  const assignedTeams = allTeams.filter((t) => assignedTeamIds.includes(t.id));
+  const allStoredTeams = (store ? await store.list('teams') : await state.teams()) || [];
+  const allTeams = allStoredTeams;
+  const activeTeams = allTeams.filter((t) => t.status !== 'removed');
+  const activeTeamIds = activeTeams.map((t) => t.id);
+
+  // In global assignment architecture:
+  // Every active PM receives every valid active team role.
+  // Workspace provisioning uses the complete active team list, not an incomplete or stale pm.teamIds list.
+  const shouldSyncGlobal = syncGlobal !== false && !pm.name?.toLowerCase().includes('other pm');
+  let assignedTeams;
+  if (shouldSyncGlobal) {
+    assignedTeams = activeTeams;
+    const currentTeamIds = pm.teamIds || [];
+    const isMissing = activeTeamIds.some((id) => !currentTeamIds.includes(id));
+    const hasObsolete = currentTeamIds.some((id) => !activeTeamIds.includes(id));
+    if (isMissing || hasObsolete) {
+      await state.updatePm(pm.id, { teamIds: activeTeamIds });
+      pm.teamIds = activeTeamIds;
+    }
+  } else {
+    const assignedTeamIds = pm.teamIds || [];
+    assignedTeams = allTeams.filter((t) => assignedTeamIds.includes(t.id));
+  }
 
   const teamRoleIds = {};
   for (const t of assignedTeams) {
@@ -148,21 +197,56 @@ export async function provisionPmWorkspace(ctx, pmId, { welcome = true, auditAct
     const ipdcRoleId = await reconciler.getObjectId(KEYS.roleIpdc);
     const toAdd = [ipdcRoleId, pmRoleId, ...Object.values(teamRoleIds)].filter(Boolean);
 
-    // Identify team roles to remove if PM was previously assigned to other teams
+    // Identify team roles to remove:
+    // Only remove team roles if the team is confirmed inactive/removed
+    // Or if not in assignedTeams (when shouldSyncGlobal is false)
     const toRemove = [];
     for (const t of allTeams) {
-      if (!assignedTeamIds.includes(t.id)) {
+      if (t.status === 'removed' || (!shouldSyncGlobal && !assignedTeams.some((at) => at.id === t.id))) {
         const otherTrId = await reconciler.getObjectId(KEYS.teamRole(t.id));
         if (otherTrId) toRemove.push(otherTrId);
       }
     }
 
+    const protectedRoles = new Set([
+      cfg?.roles?.grid,
+      cfg?.roles?.admin,
+      '1568690888413282396',
+      '1568690393824891141',
+    ].filter(Boolean));
+
+    const safeToAdd = toAdd.filter((r) => !protectedRoles.has(r));
+    const safeToRemove = toRemove.filter((r) => !protectedRoles.has(r) && !safeToAdd.includes(r));
+
     try {
-      const applied = await roles.apply(pm.discordUserId, { add: toAdd, remove: toRemove }, `IPDC PM workspace provisioning for ${pm.name}`);
+      const applied = await roles.apply(
+        pm.discordUserId,
+        { add: safeToAdd, remove: safeToRemove },
+        `IPDC PM workspace provisioning for ${pm.name}`
+      );
       rolesAdded.push(...(applied?.added || []));
       rolesRemoved.push(...(applied?.removed || []));
     } catch (e) {
       log.warn(`could not apply roles to PM user ${pm.discordUserId}: ${e.message}`);
+      const enqueueFn = ctx.queue?.enqueue
+        ? ctx.queue.enqueue.bind(ctx.queue)
+        : ctx.queue?.add
+          ? ctx.queue.add.bind(ctx.queue)
+          : null;
+      if (enqueueFn) {
+        try {
+          await enqueueFn('roles.apply', {
+            userId: pm.discordUserId,
+            add: safeToAdd,
+            remove: safeToRemove,
+          }, {
+            dedupeKey: `pm_${pm.id}_sync`,
+          });
+          log.info(`enqueued role sync retry for PM ${pm.id}`);
+        } catch (queueErr) {
+          log.warn(`failed to enqueue role sync retry: ${queueErr.message}`);
+        }
+      }
     }
   }
 
@@ -264,19 +348,62 @@ export async function provisionPmWorkspace(ctx, pmId, { welcome = true, auditAct
 }
 
 // ---------------------------------------------------------------------------
-// 3. Permission Verification & Audit Engine
+// 3. Permission Verification & Audit Engine & Repair
 // ---------------------------------------------------------------------------
 
-export async function auditPmPermissions(ctx, pmId) {
+export async function repairPmWorkspace(ctx, pmId, { auditActorId = null } = {}) {
+  return withProvisionLock(pmId, async () => {
+    const { state } = ctx;
+    const pm = await state.getPm(pmId);
+    if (!pm || pm.status === 'removed') {
+      throw new Error(`Project Manager "${pmId}" not found or removed.`);
+    }
+
+    log.info(`repairing PM workspace for ${pm.name} (${pm.id})`);
+
+    // 1. Backfill all active teams into PM's Firestore record
+    const allTeams = await state.teams();
+    const activeTeams = allTeams.filter((t) => t.status !== 'removed');
+    const activeTeamIds = activeTeams.map((t) => t.id);
+
+    await state.updatePm(pm.id, { teamIds: activeTeamIds });
+    pm.teamIds = activeTeamIds;
+
+    // 2. Provision PM workspace using internal helper (already holding lock)
+    const provRes = await _provisionPmWorkspaceInternal(ctx, pm.id, {
+      welcome: false,
+      auditActorId,
+      syncGlobal: true,
+    });
+
+    // 3. Verify permissions with audit
+    const auditRes = await auditPmPermissions(ctx, pm.id);
+
+    return {
+      ok: true,
+      pm: provRes.pm,
+      provision: provRes,
+      audit: auditRes,
+      repaired: true,
+    };
+  });
+}
+
+export async function auditPmPermissions(ctx, pmId, { auditGlobal = false } = {}) {
   const { state, reconciler, cfg, adapter } = ctx;
   const pm = await state.getPm(pmId);
   if (!pm) throw new Error(`PM "${pmId}" not found.`);
 
-  const allTeams = await state.teams();
+  const allStoredTeams = (ctx.store ? await ctx.store.list('teams') : await state.teams()) || [];
+  const allTeams = allStoredTeams;
+  const activeTeams = allTeams.filter((t) => t.status !== 'removed');
+  const activeTeamIds = activeTeams.map((t) => t.id);
   const assignedTeamIds = pm.teamIds || [];
-  const assignedTeams = allTeams.filter((t) => assignedTeamIds.includes(t.id));
+  const assignedTeams = activeTeams.filter((t) => assignedTeamIds.includes(t.id));
   const unassignedTeams = allTeams.filter((t) => !assignedTeamIds.includes(t.id));
   const otherPms = (await state.pms()).filter((p) => p.id !== pm.id && p.status !== 'removed');
+
+  const missingGlobalTeams = activeTeams.filter((t) => !assignedTeamIds.includes(t.id));
 
   const checks = [];
 
@@ -323,7 +450,7 @@ export async function auditPmPermissions(ctx, pmId) {
     pass: ownUpdatesOk,
   });
 
-  // 3. Assigned Team Resources
+  // 3. Assigned Team Resources & Channels
   for (const t of assignedTeams) {
     const trId = await reconciler.getObjectId(KEYS.teamRole(t.id));
     const canSee = trId ? await canView(KEYS.resourceForum(t.id), 'role', trId) : false;
@@ -337,7 +464,6 @@ export async function auditPmPermissions(ctx, pmId) {
 
   // 4. Unassigned Team Resources (must be DENIED)
   for (const t of unassignedTeams) {
-    // Test if the PM user directly or via their personal PM role has access
     const directAccess = await canView(KEYS.resourceForum(t.id), 'member', pmUserId);
     const roleAccess = pmRoleId ? await canView(KEYS.resourceForum(t.id), 'role', pmRoleId) : false;
     const unauthAccess = directAccess || roleAccess;
@@ -349,7 +475,7 @@ export async function auditPmPermissions(ctx, pmId) {
     });
   }
 
-  // 5. Another PM's Control Channel (must be DENIED)
+  // 5. Another PM's Control & Updates Channel (must be DENIED)
   for (const other of otherPms.slice(0, 3)) {
     const directAccess = await canView(KEYS.pmControl(other.id), 'member', pmUserId);
     const roleAccess = pmRoleId ? await canView(KEYS.pmControl(other.id), 'role', pmRoleId) : false;
@@ -359,6 +485,16 @@ export async function auditPmPermissions(ctx, pmId) {
       expected: 'DENIED',
       actual: leak ? 'ALLOWED' : 'DENIED',
       pass: !leak,
+    });
+
+    const directUpdatesAccess = await canView(KEYS.pmUpdates(other.id), 'member', pmUserId);
+    const roleUpdatesAccess = pmRoleId ? await canView(KEYS.pmUpdates(other.id), 'role', pmRoleId) : false;
+    const leakUpdates = directUpdatesAccess || roleUpdatesAccess;
+    checks.push({
+      name: `Other PM Updates Isolation (#${other.slug}-updates)`,
+      expected: 'DENIED',
+      actual: leakUpdates ? 'ALLOWED' : 'DENIED',
+      pass: !leakUpdates,
     });
   }
 
@@ -380,6 +516,19 @@ export async function auditPmPermissions(ctx, pmId) {
     pass: !gridAccess,
   });
 
+  // Optional global assignments check
+  if (auditGlobal) {
+    for (const t of activeTeams) {
+      const isAssigned = assignedTeamIds.includes(t.id);
+      checks.push({
+        name: `Global Team Assignment: ${t.name}`,
+        expected: 'ASSIGNED',
+        actual: isAssigned ? 'ASSIGNED' : 'MISSING',
+        pass: isAssigned,
+      });
+    }
+  }
+
   const pass = checks.every((c) => c.pass);
-  return { pass, checks };
+  return { pass, checks, missingGlobalTeams };
 }

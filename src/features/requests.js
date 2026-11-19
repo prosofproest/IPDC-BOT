@@ -7,6 +7,7 @@ import { say } from '../core/router.js';
 import { button, embed, row, errEmbed, okEmbed } from '../ui.js';
 import { BRAND } from '../config/constants.js';
 import { provisionPmWorkspace } from '../core/workspace.js';
+import { getValidActiveTeams } from '../core/dynamicRoles.js';
 
 const log = createLogger('requests');
 
@@ -90,7 +91,13 @@ export function register(router, ctx) {
       await state.saveMember(user, { id: user, status: 'approved', role: 'pm', pmId: pm.id, teamId: null, approvedAt: Date.now() });
       await ctx.reconciler.run('pm-approved');
       const r = await ctx.roles.memberRoleKeys({ pmId: pm.id });
-      return { add: [r.ipdc, r.pm], remove: [] };
+      const validTeams = await getValidActiveTeams(ctx);
+      const teamRoleIds = [];
+      for (const t of validTeams) {
+        const trId = t.roleId || (await ctx.reconciler?.getObjectId?.(KEYS.teamRole(t.id))) || (await ctx.roles?.idFor?.(KEYS.teamRole(t.id)));
+        if (trId) teamRoleIds.push(trId);
+      }
+      return { add: [r.ipdc, r.pm, ...teamRoleIds], remove: [] };
     }
     if (req.type === 'team_change') {
       const oldTeam = existing.teamId;
@@ -138,7 +145,9 @@ export function register(router, ctx) {
     if (req.type === 'join' || req.type === 'team_change' || req.type === 'pm_transfer') {
       const targetPm = await state.getPm(req.type === 'pm_transfer' ? req.newPmId : req.pmId);
       const targetTeam = req.type === 'join' ? req.teamId : req.newTeamId;
-      if (!targetPm || targetPm.status === 'removed' || !(targetPm.teamIds || []).includes(targetTeam)) {
+      const validTeams = await getValidActiveTeams(ctx);
+      const isValidTeam = validTeams.some((t) => t.id === targetTeam);
+      if (!targetPm || targetPm.status === 'removed' || !isValidTeam || !(targetPm.teamIds || []).includes(targetTeam)) {
         return i.editReply({ embeds: [errEmbed('The requested PM/team mapping is no longer valid. Reject this request or ask the applicant to reapply.')] });
       }
     }

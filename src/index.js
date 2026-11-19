@@ -53,13 +53,15 @@ async function main() {
   const state = new State(store);
   const audit = new Audit(store);
   const adapter = new GuildAdapter(client, cfg.discord.guildId);
-  const reconciler = new Reconciler({ adapter, store, state, cfg, audit });
-  const auth = new Auth({ ids: { grid: cfg.roles.grid, admin: cfg.roles.admin, get ipdc() { return reconciler._ipdcId; } }, getSettings: () => state.settings() });
   const queue = new RetryQueue(store);
+  const reconciler = new Reconciler({ adapter, store, state, cfg, audit, queue });
+  const auth = new Auth({ ids: { grid: cfg.roles.grid, admin: cfg.roles.admin, get ipdc() { return reconciler._ipdcId; } }, getSettings: () => state.settings() });
   const github = new GitHubClient(cfg.github);
+  const roles = new RoleService({ client, cfg, reconciler, adapter });
+  reconciler.roles = roles;
   const ctx = {
     cfg, client, store, state, auth, audit, queue, adapter, reconciler, health, github, router: null,
-    roles: new RoleService({ client, cfg, reconciler, adapter }),
+    roles,
     messages: new Messages({ client, store, cfg, reconciler }),
     managed: new Managed({ client, store, cfg, state }),
     ai: new AiService(cfg.ai, health), mailer: new Mailer(cfg.smtp, health),

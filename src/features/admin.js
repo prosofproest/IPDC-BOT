@@ -6,6 +6,7 @@ import { makeActor } from '../core/auth.js';
 import { say } from '../core/router.js';
 import { button, embed, errEmbed, okEmbed, row } from '../ui.js';
 import { provisionPmWorkspace, auditPmPermissions } from '../core/workspace.js';
+import { getValidActiveTeams } from '../core/dynamicRoles.js';
 
 const log = createLogger('admin');
 
@@ -124,7 +125,7 @@ export function register(router, ctx) {
         await state.saveMember(uid, { id: uid, status: 'approved', role: 'pm', pmId: pm.id, approvedAt: Date.now() });
       } catch (e) { note = `\nWorkspace auto-provisioning note: ${e.message}`; }
       await audit.log({ action: 'pm.created', actorId: i.user.id, targetId: uid, details: { pmId: pm.id, name: pm.name } });
-      await say(i, { embeds: [okEmbed(`PM **${pm.name}** created and workspace provisioned with personal role, control, updates, activity, and voice channels.${note}\nNext: use **Role-to-PM Mapping** to assign team roles.`)] });
+      await say(i, { embeds: [okEmbed(`PM **${pm.name}** created and workspace provisioned with personal role, control, updates, activity, and team channels.${note}\nNext: use **Role-to-PM Mapping** to verify team roles.`)] });
     } catch (e) { await say(i, { embeds: [errEmbed(e.message)] }); }
   });
 
@@ -257,20 +258,90 @@ export function register(router, ctx) {
   });
 
   // ---------- role-to-PM mapping ----------
+  function buildAdminMapPayload(pm, teams, page = 1) {
+    if (!teams.length) {
+      return { content: 'Create team roles first.', components: [] };
+    }
+
+    const needsPagination = teams.length > 125;
+    const CHUNK_SIZE = 25;
+    let pageTeams = teams;
+    let totalPages = 1;
+    let currentPage = 1;
+
+    if (needsPagination) {
+      const TEAMS_PER_PAGE = 100; // 4 rows of 25 options, leaving row 5 for navigation buttons
+      totalPages = Math.ceil(teams.length / TEAMS_PER_PAGE);
+      currentPage = Math.min(Math.max(1, parseInt(page || '1', 10) || 1), totalPages);
+      const startIdx = (currentPage - 1) * TEAMS_PER_PAGE;
+      pageTeams = teams.slice(startIdx, startIdx + TEAMS_PER_PAGE);
+    }
+
+    const rows = [];
+    const maxSelectRows = needsPagination ? 4 : 5;
+
+    for (let c = 0; c < pageTeams.length && rows.length < maxSelectRows; c += CHUNK_SIZE) {
+      const slice = pageTeams.slice(c, c + CHUNK_SIZE);
+      const rowIdx = rows.length + 1;
+      const opts = slice.map((t) => ({
+        label: t.name.slice(0, 100),
+        value: t.id,
+        default: (pm.teamIds || []).includes(t.id),
+      }));
+      const globalStart = needsPagination ? (currentPage - 1) * 100 + c + 1 : c + 1;
+      const globalEnd = globalStart + slice.length - 1;
+      const placeholder = teams.length > 25
+        ? `Select team roles (${globalStart}–${globalEnd})`
+        : 'Select team roles';
+
+      rows.push(
+        row(
+          new StringSelectMenuBuilder()
+            .setCustomId(`adm:map-set:${pm.id}:${currentPage}:${rowIdx}`)
+            .setPlaceholder(placeholder)
+            .setMinValues(0)
+            .setMaxValues(opts.length)
+            .addOptions(opts)
+        )
+      );
+    }
+
+    if (needsPagination && totalPages > 1) {
+      const prevBtn = button(`adm:map-pm:${pm.id}:${currentPage - 1}`, '◀ PREV', ButtonStyle.Secondary);
+      if (currentPage <= 1) prevBtn.setDisabled(true);
+      const nextBtn = button(`adm:map-pm:${pm.id}:${currentPage + 1}`, 'NEXT ▶', ButtonStyle.Secondary);
+      if (currentPage >= totalPages) nextBtn.setDisabled(true);
+      rows.push(row(prevBtn, nextBtn));
+    }
+
+    const pageInfo = needsPagination ? ` (Page ${currentPage} of ${totalPages} — showing ${pageTeams.length} of ${teams.length} teams)` : '';
+    const content = `Team roles for **${pm.name}**${pageInfo}. Under Option B, all valid active teams are globally assigned.`;
+
+    return { content, components: rows };
+  }
+
   guarded('button', 'adm:map', (i) => pmPicker(i, 'adm:map-pm', 'Select a PM to edit which team roles belong to their team.'));
   guarded('select', 'adm:map-pm', async (i) => {
-    const pm = await state.getPm(i.values[0]); const teams = await state.teams();
+    const pm = await state.getPm(i.values[0]);
     if (!pm) return say(i, { embeds: [errEmbed('PM not found.')] });
-    if (!teams.length) return i.update({ content: 'Create team roles first.', components: [] });
-    const opts = teams.slice(0, 25).map((t) => ({ label: t.name.slice(0, 100), value: t.id, default: (pm.teamIds || []).includes(t.id) }));
-    await i.update({ content: `Team roles for **${pm.name}**. Select all that apply, then the channels are created automatically.`, components: [row(new StringSelectMenuBuilder().setCustomId(`adm:map-set:${pm.id}`).setPlaceholder('Select team roles').setMinValues(0).setMaxValues(opts.length).addOptions(opts))] });
+    const teams = await getValidActiveTeams(ctx);
+    const payload = buildAdminMapPayload(pm, teams, 1);
+    await i.update(payload);
+  });
+  guarded('button', 'adm:map-pm', async (i, [pmId, pageStr]) => {
+    const pm = await state.getPm(pmId);
+    if (!pm) return say(i, { embeds: [errEmbed('PM not found.')] });
+    const teams = await getValidActiveTeams(ctx);
+    const payload = buildAdminMapPayload(pm, teams, pageStr || 1);
+    await i.update(payload);
   });
   guarded('select', 'adm:map-set', async (i, [pmId]) => {
     await i.deferUpdate();
     const pm = await state.getPm(pmId);
     if (!pm) { await i.editReply({ embeds: [errEmbed('PM not found.')], components: [] }); return; }
-    const before = pm.teamIds || [];
-    await state.updatePm(pmId, { teamIds: i.values });
+    const validTeams = await getValidActiveTeams(ctx);
+    const validTeamIds = validTeams.map((t) => t.id);
+    await state.updatePm(pmId, { teamIds: validTeamIds });
     let prov = { rolesAdded: [], rolesRemoved: [], resources: [] };
     try {
       prov = await provisionPmWorkspace(ctx, pmId, { welcome: false, auditActorId: i.user.id });
@@ -278,19 +349,35 @@ export function register(router, ctx) {
       log.warn(`workspace sync on mapping change failed: ${e.message}`);
       await sync('mapping-updated');
     }
-    const dropped = before.filter((t) => !i.values.includes(t));
-    const added = i.values.filter((t) => !before.includes(t));
-    await audit.log({ action: 'pm.mapping_updated', actorId: i.user.id, details: { pmId, teamIds: i.values, dropped, added } });
+    await audit.log({ action: 'pm.mapping_updated', actorId: i.user.id, details: { pmId, teamIds: validTeamIds } });
+    const teamSummary = prov.resources?.length
+      ? (prov.resources.length > 15
+        ? `${prov.resources.slice(0, 15).map((r) => r.name).join(', ')} ... (+${prov.resources.length - 15} more)`
+        : prov.resources.map((r) => r.name).join(', '))
+      : 'None';
+    const roleAddedSummary = prov.rolesAdded?.length
+      ? (prov.rolesAdded.length > 10
+        ? `${prov.rolesAdded.slice(0, 10).map((r) => `<@&${r}>`).join(', ')} ... (+${prov.rolesAdded.length - 10} more)`
+        : prov.rolesAdded.map((r) => `<@&${r}>`).join(', '))
+      : 'None';
+    const resSummary = prov.resources?.length
+      ? (prov.resources.length > 15
+        ? `${prov.resources.slice(0, 15).map((r) => `<#${r.forumId}>`).join(', ')} ... (+${prov.resources.length - 15} more)`
+        : prov.resources.map((r) => `<#${r.forumId}>`).join(', '))
+      : 'None';
+
     await i.editReply({
       content: null,
       embeds: [okEmbed(
-        `Role-to-PM Mapping successfully updated for **${pm.name}**.\n\n` +
-        `• **Assigned Teams**: ${prov.resources?.length ? prov.resources.map((r) => r.name).join(', ') : 'None'}\n` +
-        `• **Discord Roles Added**: ${prov.rolesAdded?.length ? prov.rolesAdded.map((r) => `<@&${r}>`).join(', ') : 'None'}\n` +
-        `• **Discord Roles Removed**: ${prov.rolesRemoved?.length ? prov.rolesRemoved.map((r) => `<@&${r}>`).join(', ') : 'None'}\n` +
-        `• **Resource Forums Accessible**: ${prov.resources?.length ? prov.resources.map((r) => `<#${r.forumId}>`).join(', ') : 'None'}\n\n` +
-        `Team text channels and resource visibility have been synchronized.` +
-        (dropped.length ? `\n\n*Note: ${dropped.length} previously created team text channel(s) were preserved; delete via Cleanup if no longer needed.*` : ''),
+        truncate(
+          `Role-to-PM Mapping successfully updated for **${pm.name}**.\n\n` +
+          `• **Assigned Teams** (${validTeamIds.length} total): ${teamSummary}\n` +
+          `• **Discord Roles Added**: ${roleAddedSummary}\n` +
+          `• **Discord Roles Removed**: ${prov.rolesRemoved?.length ? prov.rolesRemoved.map((r) => `<@&${r}>`).join(', ') : 'None'}\n` +
+          `• **Resource Forums Accessible**: ${resSummary}\n\n` +
+          `Team text channels and resource visibility have been synchronized.`,
+          3900
+        ),
         'Mapping Synchronized'
       )],
       components: [],

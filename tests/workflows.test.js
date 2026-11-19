@@ -89,7 +89,7 @@ test('PM application goes to #admin-approvals; PMs and members cannot approve; A
   const pm = await s.state.pmByUser('newpm'); assert.equal(pm.name, 'Neha Shah');
   assert.ok(await s.reconciler.getObjectId(KEYS.pmRole(pm.id)), 'PM-name role created');
   assert.ok(s.adapter.byName('Neha Shah').length >= 1, 'PM category created');
-  assert.equal(s.applied.at(-1).add.length, 2, 'IPDC + PM-name role only');
+  assert.equal(s.applied.at(-1).add.length, 4, 'IPDC + PM-name role + all valid active team roles');
 });
 
 test('same-PM team change: current PM decides; old role removed, IPDC/PM roles untouched', async () => {

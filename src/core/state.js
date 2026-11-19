@@ -4,7 +4,10 @@ import { newId, slugify } from '../utils/misc.js';
 // Typed accessors over the durable store. No names or IDs are hardcoded here:
 // PMs, team roles and mappings come from Admin Panel configuration.
 export class State {
-  constructor(store) { this.store = store; }
+  constructor(store) {
+    this.store = store;
+    this._teamLocks = new Map();
+  }
 
   async settings() {
     const s = (await this.store.get('config', 'settings')) || {};
@@ -21,10 +24,49 @@ export class State {
     const slug = slugify(name);
     if (pms.some((p) => p.slug === slug)) throw new Error(`A PM named "${name}" already exists.`);
     if (pms.some((p) => p.discordUserId === discordUserId)) throw new Error('That user is already a PM.');
-    const pm = { id: newId(), name: name.trim(), slug, discordUserId, teamIds: [], repo: null, status: 'active', createdAt: Date.now() };
+    const teams = await this.teams();
+    const allTeamIds = teams.map((t) => t.id);
+    const pm = { id: newId(), name: name.trim(), slug, discordUserId, teamIds: allTeamIds, repo: null, status: 'active', createdAt: Date.now() };
     await this.store.set('pms', pm.id, pm); return pm;
   }
   async updatePm(id, patch) { await this.store.merge('pms', id, patch); return this.getPm(id); }
+  async assignTeamToAllPms(teamId) {
+    const pms = await this.pms();
+    const updated = [];
+    for (const pm of pms) {
+      const cur = pm.teamIds || [];
+      if (!cur.includes(teamId)) {
+        const next = [...cur, teamId];
+        await this.store.merge('pms', pm.id, { teamIds: next });
+        updated.push({ ...pm, teamIds: next });
+      } else {
+        updated.push(pm);
+      }
+    }
+    return updated;
+  }
+  async ensureGlobalTeamRoleAssignments(validTeamIds = null) {
+    const [pms, teams] = await Promise.all([this.pms(), this.teams()]);
+    const allTeamIds = Array.isArray(validTeamIds) ? validTeamIds : teams.map((t) => t.id);
+    const updated = [];
+    for (const pm of pms) {
+      if (pm.name?.toLowerCase().includes('other pm')) {
+        updated.push(pm);
+        continue;
+      }
+      const cur = pm.teamIds || [];
+      const missing = allTeamIds.filter((tid) => !cur.includes(tid));
+      const obsolete = cur.filter((tid) => !allTeamIds.includes(tid));
+      if (missing.length > 0 || obsolete.length > 0) {
+        const next = Array.from(new Set([...cur.filter((tid) => allTeamIds.includes(tid)), ...allTeamIds]));
+        await this.store.merge('pms', pm.id, { teamIds: next });
+        updated.push({ ...pm, teamIds: next });
+      } else {
+        updated.push(pm);
+      }
+    }
+    return updated;
+  }
 
   // ---- team roles ----
   async teams() { return (await this.store.list('teams')).filter((t) => t.status !== 'removed'); }
@@ -44,22 +86,33 @@ export class State {
     return (await this.teams()).find((t) => t.name.toLowerCase() === n || t.slug === s) || null;
   }
   async createTeam({ name, roleId = null, slug = null }) {
-    const teams = await this.teams();
     const finalSlug = slug || slugify(name);
-    const existing = teams.find((t) => t.slug === finalSlug || (roleId && t.roleId === roleId));
-    if (existing) {
-      if (roleId && !existing.roleId) {
-        await this.store.merge('teams', existing.id, { roleId });
-        return this.getTeam(existing.id);
-      }
-      if (roleId && existing.roleId === roleId) {
-        return existing;
-      }
-      throw new Error(`A team role named "${name}" already exists.`);
+    const lockKey = roleId ? `role:${roleId}` : `slug:${finalSlug}`;
+    if (this._teamLocks.has(lockKey)) {
+      return this._teamLocks.get(lockKey);
     }
-    const t = { id: newId(), name: name.trim(), slug: finalSlug, roleId: roleId || null, status: 'active', createdAt: Date.now() };
-    await this.store.set('teams', t.id, t);
-    return t;
+    const p = (async () => {
+      const teams = await this.teams();
+      const existing = teams.find((t) => t.slug === finalSlug || (roleId && t.roleId === roleId));
+      if (existing) {
+        if (roleId && !existing.roleId) {
+          await this.store.merge('teams', existing.id, { roleId });
+          return this.getTeam(existing.id);
+        }
+        if (roleId && existing.roleId === roleId) {
+          return existing;
+        }
+        throw new Error(`A team role named "${name}" already exists.`);
+      }
+      const t = { id: newId(), name: name.trim(), slug: finalSlug, roleId: roleId || null, status: 'active', createdAt: Date.now() };
+      await this.store.set('teams', t.id, t);
+      await this.assignTeamToAllPms(t.id);
+      return t;
+    })().finally(() => {
+      this._teamLocks.delete(lockKey);
+    });
+    this._teamLocks.set(lockKey, p);
+    return p;
   }
   async updateTeam(id, patch) { await this.store.merge('teams', id, patch); return this.getTeam(id); }
 
