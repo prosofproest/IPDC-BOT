@@ -16,11 +16,20 @@ export class RoleService {
   }
   get guild() { return this.client.guilds.cache.get(this.cfg.discord.guildId); }
 
-  async idFor(key) {
+  async idFor(key, opts = {}) {
     let id = await this.reconciler.getObjectId(key);
-    if (!id || !(await this.adapter.getRole(id))) { await this.reconciler.run(`ensure:${key}`); id = await this.reconciler.getObjectId(key); }
-    if (!id) throw new Error(`Role for ${key} is not available yet.`);
-    return id;
+    let role = id ? await this.adapter.getRole(id) : null;
+    if (!role) {
+      if (typeof this.reconciler.ensureRole === 'function') {
+        id = await this.reconciler.ensureRole(key, opts);
+      } else {
+        await this.reconciler.run(`ensure:${key}`, opts);
+        id = await this.reconciler.getObjectId(key);
+      }
+      role = id ? await this.adapter.getRole(id) : null;
+    }
+    if (!role) throw new Error(`Role for ${key} is not available yet.`);
+    return role.id;
   }
 
   assertAllowed(ids) {
@@ -43,10 +52,10 @@ export class RoleService {
     return { added: toAdd, removed: toRemove };
   }
 
-  async memberRoleKeys({ pmId, teamId }) {
-    const out = { ipdc: await this.idFor(KEYS.roleIpdc) };
-    if (pmId) out.pm = await this.idFor(KEYS.pmRole(pmId));
-    if (teamId) out.team = await this.idFor(KEYS.teamRole(teamId));
+  async memberRoleKeys({ pmId, teamId }, opts = {}) {
+    const out = { ipdc: await this.idFor(KEYS.roleIpdc, opts) };
+    if (pmId) out.pm = await this.idFor(KEYS.pmRole(pmId), opts);
+    if (teamId) out.team = await this.idFor(KEYS.teamRole(teamId), opts);
     return out;
   }
 }

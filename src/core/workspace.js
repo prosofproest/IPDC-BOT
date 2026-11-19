@@ -5,6 +5,7 @@ import { KEYS, bitsOf, PERM_GROUPS } from './structure.js';
 import { BRAND } from '../config/constants.js';
 import { button, embed, errEmbed, okEmbed, row } from '../ui.js';
 import { pmPanelPayload } from '../features/pm.js';
+import { acquireOrderedLocks } from '../utils/lock.js';
 
 const log = createLogger('workspace');
 
@@ -134,12 +135,37 @@ export async function withProvisionLock(pmId, fn) {
 
 export async function provisionPmWorkspace(ctx, pmId, options = {}) {
   return withProvisionLock(pmId, async () => {
-    return _provisionPmWorkspaceInternal(ctx, pmId, options);
+    let leaseSet = options.lockSet || null;
+    let ownLeaseSet = null;
+
+    if (!leaseSet && ctx.store) {
+      const pm = await ctx.state?.getPm?.(pmId);
+      const lockKeys = ['reconcile', `pm:${pmId}`];
+      if (pm?.discordUserId) {
+        lockKeys.push(`member:${pm.discordUserId}`);
+      }
+      const owner = `provision-pm:${pmId}:${Date.now()}`;
+      ownLeaseSet = await acquireOrderedLocks(ctx.store, owner, lockKeys, { ttlMs: 30_000, renewIntervalMs: 5_000 });
+      if (!ownLeaseSet) {
+        throw new Error(`Could not acquire distributed workspace provisioning lock for PM "${pmId}"`);
+      }
+      leaseSet = ownLeaseSet;
+    }
+
+    try {
+      return await _provisionPmWorkspaceInternal(ctx, pmId, { ...options, lockSet: leaseSet });
+    } finally {
+      if (ownLeaseSet) {
+        await ownLeaseSet.release();
+      }
+    }
   });
 }
 
-async function _provisionPmWorkspaceInternal(ctx, pmId, { welcome = true, auditActorId = null, syncGlobal } = {}) {
+async function _provisionPmWorkspaceInternal(ctx, pmId, { welcome = true, auditActorId = null, syncGlobal, lockSet } = {}) {
   const { state, store, reconciler, roles, client, cfg, audit } = ctx;
+  await lockSet?.assertAlive();
+  const reconcileLease = lockSet?.leases?.find((l) => l.name === 'reconcile') || null;
   const pm = await state.getPm(pmId);
   if (!pm || pm.status === 'removed') throw new Error(`Project Manager "${pmId}" not found or removed.`);
 
@@ -148,7 +174,8 @@ async function _provisionPmWorkspaceInternal(ctx, pmId, { welcome = true, auditA
   // 1. Ensure personal PM role
   let pmRoleId = await reconciler.getObjectId(KEYS.pmRole(pm.id));
   if (!pmRoleId) {
-    await reconciler.run(`ensure-pm-role:${pm.id}`);
+    await lockSet?.assertAlive();
+    await reconciler.run(`ensure-pm-role:${pm.id}`, { lease: reconcileLease });
     pmRoleId = await reconciler.getObjectId(KEYS.pmRole(pm.id));
   }
 
@@ -169,7 +196,8 @@ async function _provisionPmWorkspaceInternal(ctx, pmId, { welcome = true, auditA
     const isMissing = activeTeamIds.some((id) => !currentTeamIds.includes(id));
     const hasObsolete = currentTeamIds.some((id) => !activeTeamIds.includes(id));
     if (isMissing || hasObsolete) {
-      await state.updatePm(pm.id, { teamIds: activeTeamIds });
+      await lockSet?.assertAlive();
+      await state.updatePm(pm.id, { teamIds: activeTeamIds }, { lock: lockSet });
       pm.teamIds = activeTeamIds;
     }
   } else {
@@ -181,14 +209,16 @@ async function _provisionPmWorkspaceInternal(ctx, pmId, { welcome = true, auditA
   for (const t of assignedTeams) {
     let trId = await reconciler.getObjectId(KEYS.teamRole(t.id));
     if (!trId) {
-      await reconciler.run(`ensure-team-role:${t.id}`);
+      await lockSet?.assertAlive();
+      await reconciler.run(`ensure-team-role:${t.id}`, { lease: reconcileLease });
       trId = await reconciler.getObjectId(KEYS.teamRole(t.id));
     }
     if (trId) teamRoleIds[t.id] = trId;
   }
 
   // 3. Reconcile Discord structure so all categories and channels exist
-  await reconciler.run(`pm-workspace:${pm.id}`);
+  await lockSet?.assertAlive();
+  await reconciler.run(`pm-workspace:${pm.id}`, { lease: reconcileLease });
 
   // 4. Synchronize PM member roles in Discord
   const rolesAdded = [];
@@ -219,6 +249,7 @@ async function _provisionPmWorkspaceInternal(ctx, pmId, { welcome = true, auditA
     const safeToRemove = toRemove.filter((r) => !protectedRoles.has(r) && !safeToAdd.includes(r));
 
     try {
+      await lockSet?.assertAlive();
       const applied = await roles.apply(
         pm.discordUserId,
         { add: safeToAdd, remove: safeToRemove },
@@ -235,6 +266,7 @@ async function _provisionPmWorkspaceInternal(ctx, pmId, { welcome = true, auditA
           : null;
       if (enqueueFn) {
         try {
+          await lockSet?.assertAlive();
           await enqueueFn('roles.apply', {
             userId: pm.discordUserId,
             add: safeToAdd,
@@ -272,6 +304,7 @@ async function _provisionPmWorkspaceInternal(ctx, pmId, { welcome = true, auditA
   // 6. Populate structured introduction messages via messages.ensure (idempotent, edited in place)
   if (ctx.messages?.ensure) {
     // #<slug>-control: Interactive PM Control Panel
+    await lockSet?.assertAlive();
     await ctx.messages.ensure(`pm:${pm.id}:panel`, KEYS.pmControl(pm.id), pmPanelPayload(pm));
 
     // Clean up legacy intro:control bot message if it was previously registered
@@ -286,6 +319,7 @@ async function _provisionPmWorkspaceInternal(ctx, pmId, { welcome = true, auditA
               await oldMsg.delete().catch(() => {});
             }
           }
+          await lockSet?.assertAlive();
           await ctx.store.delete('registry', `msg:pm:${pm.id}:intro:control`).catch(() => {});
         }
       } catch (e) {
@@ -294,13 +328,16 @@ async function _provisionPmWorkspaceInternal(ctx, pmId, { welcome = true, auditA
     }
 
     // #<slug>-updates: Announcements
+    await lockSet?.assertAlive();
     await ctx.messages.ensure(`pm:${pm.id}:intro:updates`, KEYS.pmUpdates(pm.id), pmUpdatesIntroPayload(pm));
 
     // #github-activity: Daily status & summaries
+    await lockSet?.assertAlive();
     await ctx.messages.ensure(`pm:${pm.id}:dash`, KEYS.pmActivity(pm.id), pmGithubActivityIntroPayload(pm, cfg?.github));
 
     // Mapped team text channels under PM category
     for (const t of assignedTeams) {
+      await lockSet?.assertAlive();
       await ctx.messages.ensure(`pm:${pm.id}:team:${t.id}:intro`, KEYS.pmTeamText(pm.id, t.id), pmTeamTextIntroPayload(pm, t));
     }
   }
@@ -308,6 +345,7 @@ async function _provisionPmWorkspaceInternal(ctx, pmId, { welcome = true, auditA
   // 7. Send PM onboarding welcome message
   if (welcome && pm.discordUserId && client?.users?.fetch) {
     try {
+      await lockSet?.assertAlive();
       const payload = pmOnboardingWelcomePayload(pm, { channels: channelIds, teams: assignedTeams });
       const user = await client.users.fetch(pm.discordUserId).catch(() => null);
       if (user) await user.send(payload).catch(() => log.info(`could not DM PM ${pm.name}; DMs might be closed`));
@@ -317,6 +355,7 @@ async function _provisionPmWorkspaceInternal(ctx, pmId, { welcome = true, auditA
   }
 
   // 8. Update PM record in Firestore with provisioning state
+  await lockSet?.assertAlive();
   const accessibleResources = assignedTeams.map((t) => ({ teamId: t.id, name: t.name, forumId: channelIds.resources[t.id] }));
   await state.updatePm(pm.id, {
     roleId: pmRoleId,
@@ -328,6 +367,7 @@ async function _provisionPmWorkspaceInternal(ctx, pmId, { welcome = true, auditA
   });
 
   if (audit) {
+    await lockSet?.assertAlive();
     await audit.log({
       action: 'pm.workspace_provisioned',
       actorId: auditActorId || null,
@@ -351,41 +391,68 @@ async function _provisionPmWorkspaceInternal(ctx, pmId, { welcome = true, auditA
 // 3. Permission Verification & Audit Engine & Repair
 // ---------------------------------------------------------------------------
 
-export async function repairPmWorkspace(ctx, pmId, { auditActorId = null } = {}) {
+export async function repairPmWorkspace(ctx, pmId, { auditActorId = null, lockSet = null } = {}) {
   return withProvisionLock(pmId, async () => {
-    const { state } = ctx;
-    const pm = await state.getPm(pmId);
-    if (!pm || pm.status === 'removed') {
-      throw new Error(`Project Manager "${pmId}" not found or removed.`);
+    let leaseSet = lockSet || null;
+    let ownLeaseSet = null;
+
+    if (!leaseSet && ctx.store) {
+      const pm = await ctx.state?.getPm?.(pmId);
+      const lockKeys = ['reconcile', `pm:${pmId}`];
+      if (pm?.discordUserId) {
+        lockKeys.push(`member:${pm.discordUserId}`);
+      }
+      const owner = `repair-pm:${pmId}:${Date.now()}`;
+      ownLeaseSet = await acquireOrderedLocks(ctx.store, owner, lockKeys, { ttlMs: 30_000, renewIntervalMs: 5_000 });
+      if (!ownLeaseSet) {
+        throw new Error(`Could not acquire distributed workspace repair lock for PM "${pmId}"`);
+      }
+      leaseSet = ownLeaseSet;
     }
 
-    log.info(`repairing PM workspace for ${pm.name} (${pm.id})`);
+    try {
+      const { state } = ctx;
+      await leaseSet?.assertAlive();
+      const pm = await state.getPm(pmId);
+      if (!pm || pm.status === 'removed') {
+        throw new Error(`Project Manager "${pmId}" not found or removed.`);
+      }
 
-    // 1. Backfill all active teams into PM's Firestore record
-    const allTeams = await state.teams();
-    const activeTeams = allTeams.filter((t) => t.status !== 'removed');
-    const activeTeamIds = activeTeams.map((t) => t.id);
+      log.info(`repairing PM workspace for ${pm.name} (${pm.id})`);
 
-    await state.updatePm(pm.id, { teamIds: activeTeamIds });
-    pm.teamIds = activeTeamIds;
+      // 1. Backfill all active teams into PM's Firestore record
+      const allTeams = await state.teams();
+      const activeTeams = allTeams.filter((t) => t.status !== 'removed');
+      const activeTeamIds = activeTeams.map((t) => t.id);
 
-    // 2. Provision PM workspace using internal helper (already holding lock)
-    const provRes = await _provisionPmWorkspaceInternal(ctx, pm.id, {
-      welcome: false,
-      auditActorId,
-      syncGlobal: true,
-    });
+      await leaseSet?.assertAlive();
+      await state.updatePm(pm.id, { teamIds: activeTeamIds }, { lock: leaseSet });
+      pm.teamIds = activeTeamIds;
 
-    // 3. Verify permissions with audit
-    const auditRes = await auditPmPermissions(ctx, pm.id);
+      // 2. Provision PM workspace using internal helper (already holding lock)
+      const provRes = await _provisionPmWorkspaceInternal(ctx, pm.id, {
+        welcome: false,
+        auditActorId,
+        syncGlobal: true,
+        lockSet: leaseSet,
+      });
 
-    return {
-      ok: true,
-      pm: provRes.pm,
-      provision: provRes,
-      audit: auditRes,
-      repaired: true,
-    };
+      // 3. Verify permissions with audit
+      await leaseSet?.assertAlive();
+      const auditRes = await auditPmPermissions(ctx, pm.id);
+
+      return {
+        ok: true,
+        pm: provRes.pm,
+        provision: provRes,
+        audit: auditRes,
+        repaired: true,
+      };
+    } finally {
+      if (ownLeaseSet) {
+        await ownLeaseSet.release();
+      }
+    }
   });
 }
 

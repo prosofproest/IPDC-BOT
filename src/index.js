@@ -66,6 +66,7 @@ async function main() {
     managed: new Managed({ client, store, cfg, state }),
     ai: new AiService(cfg.ai, health), mailer: new Mailer(cfg.smtp, health),
   };
+  reconciler.managed = ctx.managed;
   health.github = github;
   ctx.activity = new Activity({ github, state, store, health });
   ctx.monitoring = new Monitoring(ctx);

@@ -7,6 +7,7 @@ import { say } from '../core/router.js';
 import { button, embed, errEmbed, okEmbed, row } from '../ui.js';
 import { provisionPmWorkspace, auditPmPermissions } from '../core/workspace.js';
 import { getValidActiveTeams } from '../core/dynamicRoles.js';
+import { acquireRenewableLock } from '../utils/lock.js';
 
 const log = createLogger('admin');
 
@@ -196,13 +197,58 @@ export function register(router, ctx) {
     await i.update({ content: null, embeds: [errEmbed(`Removing **${pm.name}** permanently deletes the PM role, category, control/updates/activity channels, team channels and voice channels. Member records are kept but unassigned. This cannot be undone.`, 'Confirm Destructive Action')], components: [row(button(`adm:pm-del-ok:${pm.id}`, 'PERMANENTLY REMOVE', ButtonStyle.Danger))] });
   });
   guarded('button', 'adm:pm-del-ok', async (i, [id]) => {
-    await i.deferUpdate(); const pm = await state.getPm(id);
+    await i.deferUpdate();
+    const pm = await state.getPm(id);
     if (!pm) { await i.editReply({ embeds: [errEmbed('PM not found.')], components: [] }); return; }
-    const n = await managed.deleteWhere((k) => k.startsWith(`pm:${id}:`) || k.startsWith(`msg:pm:${id}:`), `IPDC admin removed PM ${pm.name}`);
-    await state.updatePm(id, { status: 'removed', removedAt: Date.now() });
-    for (const m of (await state.members()).filter((x) => x.pmId === id)) await state.saveMember(m.id, { pmId: null, teamId: null, status: 'unassigned' });
-    await audit.log({ action: 'pm.removed', actorId: i.user.id, level: 'warn', details: { pmId: id, name: pm.name, objectsDeleted: n } });
-    await i.editReply({ embeds: [okEmbed(`PM **${pm.name}** removed (${n} managed objects deleted).`)], components: [] });
+
+    const lockOwner = `pm-del:${id}:${Date.now()}`;
+    const pmLease = await acquireRenewableLock(store, `pm:${id}`, lockOwner, { ttlMs: 15_000, renewIntervalMs: 5_000 });
+    if (!pmLease) {
+      await i.editReply({ embeds: [errEmbed('Another administrative operation is in progress for this PM. Please try again shortly.')], components: [] });
+      return;
+    }
+
+    try {
+      await pmLease.assertAlive();
+      await state.updatePm(id, { status: 'deleting', deletingAt: Date.now() }, { lock: pmLease });
+      const pred = (k) => k.startsWith(`pm:${id}:`) || k.startsWith(`msg:pm:${id}:`);
+      const n = await managed.deleteWhere(pred, `IPDC admin removed PM ${pm.name}`);
+      const remaining = (await store.list('registry')).filter((r) => pred(r.key));
+      if (remaining.length > 0) {
+        throw new Error(`PM deletion incomplete: ${remaining.length} managed objects could not be deleted from Discord.`);
+      }
+      await pmLease.assertAlive();
+      let allMembersCleaned = true;
+      for (const m of (await state.members()).filter((x) => x.pmId === id)) {
+        await pmLease.assertAlive();
+        const memOwner = `pm-del-mem:${id}:${m.id}:${Date.now()}`;
+        const memLease = await acquireRenewableLock(store, `member:${m.id}`, memOwner, { ttlMs: 10_000, renewIntervalMs: 3_000 });
+        if (!memLease) {
+          log.warn(`could not acquire lock for member ${m.id} during PM ${id} removal; skipping`);
+          allMembersCleaned = false;
+          continue;
+        }
+        try {
+          await memLease.assertAlive();
+          await pmLease.assertAlive();
+          await state.saveMember(m.id, { pmId: null, teamId: null, status: 'unassigned' }, { lock: [pmLease, memLease] });
+        } finally {
+          await memLease.release();
+        }
+      }
+      await pmLease.assertAlive();
+      if (!allMembersCleaned) {
+        throw new Error(`PM deletion incomplete: some member locks could not be acquired; left in deleting state for recovery`);
+      }
+      await state.updatePm(id, { status: 'removed', removedAt: Date.now() }, { lock: pmLease });
+      await audit.log({ action: 'pm.removed', actorId: i.user.id, level: 'warn', details: { pmId: id, name: pm.name, objectsDeleted: n } });
+      await i.editReply({ embeds: [okEmbed(`PM **${pm.name}** removed (${n} managed objects deleted).`)], components: [] });
+    } catch (e) {
+      log.error(`PM deletion failed for ${id}`, e);
+      await i.editReply({ embeds: [errEmbed(`PM removal encountered an error: ${e.message}. Status remains 'deleting' for recovery.`)], components: [] });
+    } finally {
+      await pmLease.release();
+    }
   });
 
   // ---------- team roles ----------
@@ -247,14 +293,63 @@ export function register(router, ctx) {
     await i.update({ content: null, embeds: [errEmbed(`Removing **${t.name}** permanently deletes the role, resource forum (with its posts) and all PM team channels for it. This cannot be undone.`, 'Confirm Destructive Action')], components: [row(button(`adm:team-del-ok:${t.id}`, 'PERMANENTLY REMOVE', ButtonStyle.Danger))] });
   });
   guarded('button', 'adm:team-del-ok', async (i, [id]) => {
-    await i.deferUpdate(); const t = await state.getTeam(id);
+    await i.deferUpdate();
+    const t = await state.getTeam(id);
     if (!t) { await i.editReply({ embeds: [errEmbed('Team role not found.')], components: [] }); return; }
-    const n = await managed.deleteWhere((k) => k === KEYS.teamRole(id) || k === KEYS.resourceForum(id) || (k.startsWith('pm:') && k.endsWith(`:team:${id}:text`)), `IPDC admin removed team ${t.name}`);
-    await state.updateTeam(id, { status: 'removed', removedAt: Date.now() });
-    for (const pm of await state.pms()) if ((pm.teamIds || []).includes(id)) await state.updatePm(pm.id, { teamIds: pm.teamIds.filter((x) => x !== id) });
-    for (const m of (await state.members()).filter((x) => x.teamId === id)) await state.saveMember(m.id, { teamId: null });
-    await audit.log({ action: 'team.removed', actorId: i.user.id, level: 'warn', details: { teamId: id, name: t.name, objectsDeleted: n } });
-    await i.editReply({ embeds: [okEmbed(`Team role **${t.name}** removed (${n} managed objects deleted).`)], components: [] });
+
+    const lockOwner = `team-del:${id}:${Date.now()}`;
+    const teamLease = await acquireRenewableLock(store, `team:${id}`, lockOwner, { ttlMs: 15_000, renewIntervalMs: 5_000 });
+    if (!teamLease) {
+      await i.editReply({ embeds: [errEmbed('Another administrative operation is in progress for this team role. Please try again shortly.')], components: [] });
+      return;
+    }
+
+    try {
+      await teamLease.assertAlive();
+      await state.updateTeam(id, { status: 'deleting', deletingAt: Date.now() }, { lock: teamLease });
+      const pred = (k) => k === KEYS.teamRole(id) || k === KEYS.resourceForum(id) || (k.startsWith('pm:') && k.endsWith(`:team:${id}:text`));
+      const n = await managed.deleteWhere(pred, `IPDC admin removed team ${t.name}`);
+      const remaining = (await store.list('registry')).filter((r) => pred(r.key));
+      if (remaining.length > 0) {
+        throw new Error(`Team role deletion incomplete: ${remaining.length} managed objects could not be deleted from Discord.`);
+      }
+      await teamLease.assertAlive();
+      for (const pm of await state.pms()) {
+        if ((pm.teamIds || []).includes(id)) {
+          await state.updatePm(pm.id, { teamIds: pm.teamIds.filter((x) => x !== id) }, { lock: teamLease });
+        }
+      }
+      let allMembersCleaned = true;
+      for (const m of (await state.members()).filter((x) => x.teamId === id)) {
+        await teamLease.assertAlive();
+        const memOwner = `team-del-mem:${id}:${m.id}:${Date.now()}`;
+        const memLease = await acquireRenewableLock(store, `member:${m.id}`, memOwner, { ttlMs: 10_000, renewIntervalMs: 3_000 });
+        if (!memLease) {
+          log.warn(`could not acquire lock for member ${m.id} during team ${id} removal; skipping`);
+          allMembersCleaned = false;
+          continue;
+        }
+        try {
+          await memLease.assertAlive();
+          await teamLease.assertAlive();
+          await state.saveMember(m.id, { teamId: null }, { lock: [teamLease, memLease] });
+        } finally {
+          await memLease.release();
+        }
+      }
+      await teamLease.assertAlive();
+      if (!allMembersCleaned) {
+        throw new Error(`Team removal incomplete: some member locks could not be acquired; left in deleting state for recovery`);
+      }
+      await state.updateTeam(id, { status: 'removed', removedAt: Date.now() }, { lock: teamLease });
+      await audit.log({ action: 'team.removed', actorId: i.user.id, level: 'warn', details: { teamId: id, name: t.name, objectsDeleted: n } });
+      await i.editReply({ embeds: [okEmbed(`Team role **${t.name}** removed (${n} managed objects deleted).`)], components: [] });
+    } catch (e) {
+      log.error(`Team role deletion failed for ${id}`, e);
+      await i.editReply({ embeds: [errEmbed(`Team role removal encountered an error: ${e.message}. Status remains 'deleting' for recovery.`)], components: [] });
+    } finally {
+      await teamLease.release();
+    }
   });
 
   // ---------- role-to-PM mapping ----------

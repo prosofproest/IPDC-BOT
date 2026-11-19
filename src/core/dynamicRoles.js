@@ -3,6 +3,7 @@ import { createLogger } from '../utils/logger.js';
 import { slugify } from '../utils/misc.js';
 import { KEYS } from './structure.js';
 import { provisionPmWorkspace } from './workspace.js';
+import { acquireRenewableLock } from '../utils/lock.js';
 
 const log = createLogger('dynamic-roles');
 
@@ -122,13 +123,10 @@ export async function getValidActiveTeams(ctx) {
       continue;
     }
 
-    // Resolve Discord role ID from team or reconciler/registry/roles
+    // Resolve Discord role ID from team or reconciler/registry (never trigger recursive reconciliation)
     let roleId = team.roleId;
     if (!roleId && reconciler?.getObjectId) {
       roleId = await reconciler.getObjectId(KEYS.teamRole(team.id)).catch(() => null);
-    }
-    if (!roleId && roles?.idFor) {
-      roleId = await roles.idFor(KEYS.teamRole(team.id)).catch(() => null);
     }
     if (!roleId && store?.get) {
       const reg = await store.get('registry', KEYS.teamRole(team.id)).catch(() => null);
@@ -181,6 +179,7 @@ export async function getValidActiveTeams(ctx) {
         log.warn(`failed to get role from roles service for team "${team.name}": ${e.message}`);
       }
     }
+
 
     // Missing or unverified role must be safely excluded (never classify unverified role as valid)
     if (!discordRole) {
@@ -475,66 +474,112 @@ export async function handleRoleDelete(ctx, role) {
     const team = await state.teamByRole(role.id) || await state.teamByName(role.name);
     if (team) {
       log.info(`cleaning up resources for deleted team role "${team.name}" (${team.id})`);
+      const teamOwner = `role-del-team:${team.id}:${Date.now()}`;
+      const teamLease = await acquireRenewableLock(store, `team:${team.id}`, teamOwner, { ttlMs: 15_000, renewIntervalMs: 5_000 });
+      if (!teamLease) {
+        log.warn(`could not acquire lock for team ${team.id} during role deletion; skipping to allow recovery sweep`);
+        return { handled: false, reason: 'lock-unavailable' };
+      }
+      try {
+        await teamLease.assertAlive();
+        await state.updateTeam(team.id, { status: 'deleting', deletingAt: Date.now() }, { lock: teamLease });
 
-      // Positively verify emptiness of resource forum across active and archived threads
-      const hasManualContent = await forumHasManualContent(client, cfg, reconciler, team.id);
+        // Positively verify emptiness of resource forum across active and archived threads
+        const hasManualContent = await forumHasManualContent(client, cfg, reconciler, team.id);
+        await teamLease.assertAlive();
 
-      if (managed) {
+        if (managed) {
+          if (!hasManualContent) {
+            await managed.deleteManaged(KEYS.resourceForum(team.id), 'Team role deleted in Discord');
+          } else {
+            log.info(`preserving resource forum for team ${team.name} due to existing forum content or conservative fail-safe`);
+          }
+          await teamLease.assertAlive();
+          await managed.deleteManaged(KEYS.teamRole(team.id), 'Team role deleted in Discord');
+        }
+
+        await teamLease.assertAlive();
+
+        // Clean registry keys
+        await store.delete('registry', KEYS.teamRole(team.id));
         if (!hasManualContent) {
-          await managed.deleteManaged(KEYS.resourceForum(team.id), 'Team role deleted in Discord');
-        } else {
-          log.info(`preserving resource forum for team ${team.name} due to existing forum content or conservative fail-safe`);
+          await store.delete('registry', KEYS.resourceForum(team.id));
         }
-        await managed.deleteManaged(KEYS.teamRole(team.id), 'Team role deleted in Discord');
-      }
 
-      // Clean registry keys
-      await store.delete('registry', KEYS.teamRole(team.id));
-      if (!hasManualContent) {
-        await store.delete('registry', KEYS.resourceForum(team.id));
-      }
-
-      // PM team text channels: NEVER delete Discord channels during team role deletion.
-      // Remove only their bot-managed registry mappings to preserve chat history, manual messages, attachments, and threads.
-      const regRows = await store.list('registry');
-      for (const r of regRows) {
-        if (r.key?.endsWith(`:team:${team.id}:text`)) {
-          await store.delete('registry', r.key);
-          log.info(`unmanaged registry mapping for ${r.key}; preserved Discord channel and all message history`);
-        }
-      }
-
-      // Update PMs in Firestore: remove deleted team from all PM records and Discord roles
-      const roleService = roles || ctx.roles;
-      for (const p of await state.pms()) {
-        if ((p.teamIds || []).includes(team.id)) {
-          await state.updatePm(p.id, { teamIds: p.teamIds.filter((t) => t !== team.id) });
-        }
-        if (p.discordUserId && roleService?.apply) {
-          try {
-            await roleService.apply(p.discordUserId, { remove: [role.id] }, `IPDC team role deleted: ${team.name}`);
-          } catch (e) {
-            log.debug(`could not remove deleted role ${role.id} from ${p.name}: ${e.message}`);
+        // PM team text channels: NEVER delete Discord channels during team role deletion.
+        // Remove only their bot-managed registry mappings to preserve chat history, manual messages, attachments, and threads.
+        const regRows = await store.list('registry');
+        for (const r of regRows) {
+          if (r.key?.endsWith(`:team:${team.id}:text`)) {
+            await store.delete('registry', r.key);
+            log.info(`unmanaged registry mapping for ${r.key}; preserved Discord channel and all message history`);
           }
         }
-      }
 
-      // Unset teamId from members who had this teamId - member accounts remain intact
-      for (const m of (await state.members()).filter((x) => x.teamId === team.id)) {
-        await state.saveMember(m.id, { teamId: null });
-      }
+        await teamLease.assertAlive();
 
-      // Soft-delete team in Firestore
-      await state.updateTeam(team.id, { status: 'removed', removedAt: Date.now() });
+        // Verify registry entries for this team are deleted before marking removed
+        const pred = (k) => k === KEYS.teamRole(team.id) || (!hasManualContent && k === KEYS.resourceForum(team.id)) || (k.startsWith('pm:') && k.endsWith(`:team:${team.id}:text`));
+        const remaining = (await store.list('registry')).filter((r) => pred(r.key));
+        if (remaining.length > 0) {
+          throw new Error(`Team role deletion incomplete: ${remaining.length} managed objects remain in registry.`);
+        }
 
-      if (audit) {
-        await audit.log({
-          action: 'team.role_deleted',
-          targetId: role.id,
-          details: { teamId: team.id, name: team.name },
-        });
+        // Update PMs in Firestore: remove deleted team from all PM records and Discord roles
+        const roleService = roles || ctx.roles;
+        for (const p of await state.pms()) {
+          await teamLease.assertAlive();
+          if ((p.teamIds || []).includes(team.id)) {
+            await state.updatePm(p.id, { teamIds: p.teamIds.filter((t) => t !== team.id) }, { lock: teamLease });
+          }
+          if (p.discordUserId && roleService?.apply) {
+            try {
+              await roleService.apply(p.discordUserId, { remove: [role.id] }, `IPDC team role deleted: ${team.name}`);
+            } catch (e) {
+              log.debug(`could not remove deleted role ${role.id} from ${p.name}: ${e.message}`);
+            }
+          }
+        }
+
+        // Unset teamId from members who had this teamId under individual member locks
+        let allMembersCleaned = true;
+        for (const m of (await state.members()).filter((x) => x.teamId === team.id)) {
+          await teamLease.assertAlive();
+          const memOwner = `role-del-mem:${team.id}:${m.id}:${Date.now()}`;
+          const memLease = await acquireRenewableLock(store, `member:${m.id}`, memOwner, { ttlMs: 10_000, renewIntervalMs: 3_000 });
+          if (!memLease) {
+            log.warn(`could not acquire lock for member ${m.id} during team role deletion; skipping`);
+            allMembersCleaned = false;
+            continue;
+          }
+          try {
+            await memLease.assertAlive();
+            await teamLease.assertAlive();
+            await state.saveMember(m.id, { teamId: null }, { lock: [teamLease, memLease] });
+          } finally {
+            await memLease.release();
+          }
+        }
+
+        await teamLease.assertAlive();
+        if (!allMembersCleaned) {
+          throw new Error(`Team role deletion incomplete: some member locks could not be acquired; left in deleting state`);
+        }
+
+        // Soft-delete team in Firestore only after full cleanup succeeds
+        await state.updateTeam(team.id, { status: 'removed', removedAt: Date.now() }, { lock: teamLease });
+
+        if (audit) {
+          await audit.log({
+            action: 'team.role_deleted',
+            targetId: role.id,
+            details: { teamId: team.id, name: team.name },
+          });
+        }
+        return { handled: true, type: 'team', team };
+      } finally {
+        await teamLease.release();
       }
-      return { handled: true, type: 'team', team };
     }
 
     // 2. Check if associated with a PM
@@ -542,22 +587,59 @@ export async function handleRoleDelete(ctx, role) {
     const pm = pms.find((p) => p.roleId === role.id || p.name.toLowerCase() === role.name.toLowerCase());
     if (pm) {
       log.info(`cleaning up workspace for deleted PM role "${pm.name}" (${pm.id})`);
-      if (managed) {
-        await managed.deleteWhere((k) => k.startsWith(`pm:${pm.id}:`) || k.startsWith(`msg:pm:${pm.id}:`), 'PM role deleted in Discord');
+      const pmOwner = `role-del-pm:${pm.id}:${Date.now()}`;
+      const pmLease = await acquireRenewableLock(store, `pm:${pm.id}`, pmOwner, { ttlMs: 15_000, renewIntervalMs: 5_000 });
+      if (!pmLease) {
+        log.warn(`could not acquire lock for PM ${pm.id} during role deletion; skipping to allow recovery sweep`);
+        return { handled: false, reason: 'lock-unavailable' };
       }
-      await state.updatePm(pm.id, { status: 'removed', removedAt: Date.now() });
-      for (const m of await state.membersOfPm(pm.id)) {
-        await state.saveMember(m.id, { pmId: null, teamId: null, status: 'unassigned' });
-      }
+      try {
+        await pmLease.assertAlive();
+        await state.updatePm(pm.id, { status: 'deleting', deletingAt: Date.now() }, { lock: pmLease });
+        const pred = (k) => k.startsWith(`pm:${pm.id}:`) || k.startsWith(`msg:pm:${pm.id}:`);
+        if (managed) {
+          await managed.deleteWhere(pred, 'PM role deleted in Discord');
+        }
+        await pmLease.assertAlive();
+        const remaining = (await store.list('registry')).filter((r) => pred(r.key));
+        if (remaining.length > 0) {
+          throw new Error(`PM role deletion incomplete: ${remaining.length} managed objects remain in registry.`);
+        }
+        let allMembersCleaned = true;
+        for (const m of await state.membersOfPm(pm.id)) {
+          await pmLease.assertAlive();
+          const memOwner = `role-del-pm-mem:${pm.id}:${m.id}:${Date.now()}`;
+          const memLease = await acquireRenewableLock(store, `member:${m.id}`, memOwner, { ttlMs: 10_000, renewIntervalMs: 3_000 });
+          if (!memLease) {
+            log.warn(`could not acquire lock for member ${m.id} during PM role deletion; skipping`);
+            allMembersCleaned = false;
+            continue;
+          }
+          try {
+            await memLease.assertAlive();
+            await pmLease.assertAlive();
+            await state.saveMember(m.id, { pmId: null, teamId: null, status: 'unassigned' }, { lock: [pmLease, memLease] });
+          } finally {
+            await memLease.release();
+          }
+        }
+        await pmLease.assertAlive();
+        if (!allMembersCleaned) {
+          throw new Error(`PM role deletion incomplete: some member locks could not be acquired; left in deleting state`);
+        }
+        await state.updatePm(pm.id, { status: 'removed', removedAt: Date.now() }, { lock: pmLease });
 
-      if (audit) {
-        await audit.log({
-          action: 'pm.role_deleted',
-          targetId: role.id,
-          details: { pmId: pm.id, name: pm.name },
-        });
+        if (audit) {
+          await audit.log({
+            action: 'pm.role_deleted',
+            targetId: role.id,
+            details: { pmId: pm.id, name: pm.name },
+          });
+        }
+        return { handled: true, type: 'pm', pm };
+      } finally {
+        await pmLease.release();
       }
-      return { handled: true, type: 'pm', pm };
     }
 
     return { ignored: true, reason: 'unmatched' };
