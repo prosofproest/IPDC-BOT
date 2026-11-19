@@ -30,7 +30,7 @@ export class Panels {
     }
     // dashboards: created once as placeholders, then edited by the monitoring job
     const ph = [['dash:heatmap', 'ch:github-contributions', 'GITHUB CONTRIBUTION HEATMAPS'], ['dash:leaderboard', 'ch:contribution-leaderboard', 'CONTRIBUTION LEADERBOARD'],
-      ['dash:server-activity', 'ch:server-activity', 'SERVER ACTIVITY'], ['dash:challenges', 'ch:github-challenges', 'GITHUB CHALLENGES'], ['dash:monitoring:0', 'ch:server-monitoring', 'SERVER MONITORING']];
+      ['dash:server-activity', 'ch:server-activity', 'SERVER ACTIVITY'], ['dash:monitoring:0', 'ch:server-monitoring', 'SERVER MONITORING']];
     for (const [k, ch, t] of ph) await messages.ensure(k, ch, placeholder(t), { refresh: false });
     log.info('panels ensured');
   }
@@ -38,7 +38,6 @@ export class Panels {
   async refresh(name) {
     const { messages, state } = this.ctx;
     if (name === 'support') return messages.ensure('panel:support', 'ch:support-center', supportPanelPayload((await state.settings()).supportCategories));
-    if (name === 'challenges') return this.ctx.monitoring.refreshPm ? this.ctx.monitoring.refreshAll().catch((e) => log.warn('challenge refresh failed', e)) : null;
   }
   async refreshPm(pmId) {
     const pm = await this.ctx.state.getPm(pmId); if (!pm) return;

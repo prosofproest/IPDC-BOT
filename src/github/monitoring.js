@@ -156,23 +156,6 @@ export class Monitoring {
     return Date.now() - Math.max(last, since) > days * DAY;
   }
 
-  async challengesPayload(snaps) {
-    const list = (await this.c.store.list('challenges')).filter((c) => c.status === 'active' && c.endsAt > Date.now());
-    const comps = []; const embeds = [];
-    for (const ch of list.slice(0, 9)) {
-      const counts = new Map();
-      for (const d of snaps) if (d.ok) {
-        const items = ch.metric === 'commits' ? d.commits.filter((c) => c.userId && new Date(c.date).getTime() >= ch.startsAt) : d.pulls.filter((p) => p.userId && new Date(p.createdAt).getTime() >= ch.startsAt);
-        for (const it of items) if ((ch.participants || []).includes(it.userId)) counts.set(it.userId, (counts.get(it.userId) || 0) + 1);
-      }
-      const rank = (ch.participants || []).map((id) => [id, counts.get(id) || 0]).sort((a, b) => b[1] - a[1]).slice(0, 10);
-      embeds.push(embed({ title: `CHALLENGE — ${ch.title}`, color: BRAND.accent, description: `${ch.description}\n\nGoal: **${ch.target} ${ch.metric.replace('_', ' ')}** per member — ends ${fmtIST(ch.endsAt)}\nParticipants: ${(ch.participants || []).length}\n\n${rank.map(([id, n], i) => `${i + 1}. <@${id}> — ${Math.min(n, ch.target)}/${ch.target} \`${bar(Math.min(n, ch.target), ch.target, 8)}\`${n >= ch.target ? ' complete' : ''}`).join('\n') || 'No participants yet.'}`, footer: NOTE }));
-    }
-    if (list.length) comps.push(row(new StringSelectMenuBuilder().setCustomId('chal:join').setPlaceholder('Join a challenge').addOptions(list.slice(0, 25).map((c) => ({ label: c.title.slice(0, 100), value: c.id })))));
-    if (!embeds.length) embeds.push(embed({ title: 'GITHUB CHALLENGES', description: 'No active challenges right now. New coding and contribution challenges are announced here by the IPDC administrators.' }));
-    return { embeds, components: comps, allowedMentions: { parse: [] } };
-  }
-
   // ------------------------------------------------------------------ publishing
   async aiLine(key, data) {
     try {
@@ -191,7 +174,6 @@ export class Monitoring {
     if (!pmIds) {
       await messages.ensure('dash:heatmap', 'ch:github-contributions', await this.heatmapPayload(cals, members));
       await messages.ensure('dash:leaderboard', 'ch:contribution-leaderboard', this.leaderboardPayload(cals, members, names, s.leaderboardDays));
-      await messages.ensure('dash:challenges', 'ch:github-challenges', await this.challengesPayload(snaps));
     }
     const ai = snaps.length ? await this.aiLine('server', { ok: true, repo: 'all PM repositories', commits: snaps.flatMap((d) => (d.ok ? d.commits : [])), pulls: snaps.flatMap((d) => (d.ok ? d.pulls : [])) }) : null;
     await messages.ensure('dash:server-activity', 'ch:server-activity', await this.serverActivityPayload(snaps, ai));

@@ -17,7 +17,6 @@ const GRANTS = [
   ['monitoring.view', 'View server-wide monitoring'],
   ['config.manage', 'Manage PM / team configuration'],
   ['resource.manage', 'Manage resource forums'],
-  ['challenge.manage', 'Manage challenges'],
   ['application.approve.initial', 'Approve initial team applications'],
   ['teamchange.approve', 'Approve same-PM team changes'],
   ['pm.channels.view', 'View PM team channels and voice'],
@@ -38,7 +37,7 @@ export function adminPanelPayload() {
     components: [
       row(b('adm:dash', 'DASHBOARD', ButtonStyle.Primary), b('adm:pm', 'PM MANAGEMENT'), b('adm:team', 'TEAM ROLES'), b('adm:map', 'ROLE-TO-PM MAPPING'), b('adm:appr', 'APPLICATIONS')),
       row(b('adm:res', 'RESOURCES'), b('adm:tix', 'SUPPORT TICKETS'), b('adm:perm', 'PERMISSIONS'), b('adm:audit', 'AUDIT LOGS'), b('adm:set', 'SERVER SETTINGS')),
-      row(b('adm:chal', 'CHALLENGES'), b('adm:gh', 'GITHUB LINK OVERRIDE'), b('adm:repair', 'REPAIR STRUCTURE', ButtonStyle.Success), b('adm:clean', 'CLEANUP (DESTRUCTIVE)', ButtonStyle.Danger)),
+      row(b('adm:gh', 'GITHUB LINK OVERRIDE'), b('adm:repair', 'REPAIR STRUCTURE', ButtonStyle.Success), b('adm:clean', 'CLEANUP (DESTRUCTIVE)', ButtonStyle.Danger)),
     ],
   };
 }
@@ -578,33 +577,6 @@ export function register(router, ctx) {
     await state.saveSettings({ inactivityDays, leaderboardDays, heatmapWeeks, reportRecipients: mails });
     await audit.log({ action: 'settings.updated', actorId: i.user.id, details: { inactivityDays, leaderboardDays, heatmapWeeks, recipients: mails.length } });
     await say(i, { embeds: [okEmbed('Settings saved.')] });
-  });
-
-  // ---------- challenges ----------
-  guarded('button', 'adm:chal', async (i) => {
-    const ch = (await store.list('challenges')).filter((c) => c.status === 'active');
-    await say(i, { embeds: [embed({ title: 'CHALLENGES', description: ch.map((c) => `**${c.title}** — ${c.target} ${c.metric} — ends ${fmtIST(c.endsAt)}`).join('\n') || 'No active challenges.' })],
-      components: [row(button('adm:chal-new', 'NEW CHALLENGE', ButtonStyle.Primary), button('adm:chal-end', 'END CHALLENGE', ButtonStyle.Secondary, !ch.length))] });
-  });
-  guarded('button', 'adm:chal-new', (i) => i.showModal(modal('adm:chal-modal', 'New Challenge', input('title', 'Title', { max: 80 }), input('desc', 'Description', { long: true, max: 600 }), input('metric', 'Metric: commits or pull_requests', { value: 'commits', max: 14 }), input('target', 'Target count per member', { max: 5, ph: '20' }), input('days', 'Duration in days', { max: 3, ph: '14' }))));
-  guarded('modal', 'adm:chal-modal', async (i) => {
-    const metric = i.fields.getTextInputValue('metric').trim().toLowerCase(); const target = Number.parseInt(i.fields.getTextInputValue('target'), 10); const days = Number.parseInt(i.fields.getTextInputValue('days'), 10);
-    if (!['commits', 'pull_requests'].includes(metric) || !(target > 0) || !(days > 0 && days <= 365)) return say(i, { embeds: [errEmbed('Metric must be commits or pull_requests; target and days must be positive numbers.')] });
-    const c = { id: newId(), title: i.fields.getTextInputValue('title').trim(), description: i.fields.getTextInputValue('desc').trim(), metric, target, startsAt: Date.now(), endsAt: Date.now() + days * 86400000, status: 'active', participants: [], createdBy: i.user.id };
-    await store.set('challenges', c.id, c);
-    await audit.log({ action: 'challenge.created', actorId: i.user.id, details: { id: c.id, title: c.title } });
-    await ctx.panels?.refresh?.('challenges');
-    await say(i, { embeds: [okEmbed(`Challenge **${c.title}** is live in #github-challenges.`)] });
-  });
-  guarded('button', 'adm:chal-end', async (i) => {
-    const ch = (await store.list('challenges')).filter((c) => c.status === 'active');
-    await say(i, { content: 'Which challenge should end now?', components: [row(menu('adm:chal-end-sel', 'Select a challenge', ch.map((c) => ({ label: c.title.slice(0, 100), value: c.id }))))] });
-  });
-  guarded('select', 'adm:chal-end-sel', async (i) => {
-    await store.merge('challenges', i.values[0], { status: 'ended', endedAt: Date.now() });
-    await audit.log({ action: 'challenge.ended', actorId: i.user.id, details: { id: i.values[0] } });
-    await ctx.panels?.refresh?.('challenges');
-    await i.update({ content: 'Challenge ended.', components: [] });
   });
 
   // ---------- GitHub override ----------

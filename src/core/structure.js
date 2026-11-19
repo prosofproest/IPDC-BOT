@@ -94,7 +94,6 @@ export function buildStructure({ pms = [], teams = [], members = [], settings = 
   text('ch:github-contributions', 'github-contributions', 'cat:challenges', ipdcReadOnly, { topic: 'Member contribution heatmaps. Updated daily at 9 PM IST.' });
   text('ch:contribution-leaderboard', 'contribution-leaderboard', 'cat:challenges', ipdcReadOnly, { topic: 'Server-wide contribution ranking.' });
   text('ch:server-activity', 'server-activity', 'cat:challenges', ipdcReadOnly, { topic: 'Server-wide and PM team activity dashboard.' });
-  text('ch:github-challenges', 'github-challenges', 'cat:challenges', ipdcReadOnly, { topic: 'Coding and contribution challenges.' });
   voice('vc:coding-room', 'Coding Room', 'cat:challenges', ipdcVoice);
   voice('vc:collaboration-room', 'Collaboration Room', 'cat:challenges', ipdcVoice);
 

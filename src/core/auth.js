@@ -39,7 +39,6 @@ export class Auth {
       case 'monitoring.view':
       case 'config.manage':
       case 'resource.manage':
-      case 'challenge.manage':
         return adminGranted;
       case 'application.approve.initial':
       case 'teamchange.approve':

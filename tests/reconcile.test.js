@@ -18,7 +18,7 @@ test('first run creates the full static structure with professional names', asyn
   assert.equal(res.errors.length, 0, res.errors.join('; '));
   const names = [...env.adapter.channels.values()].map((c) => c.name);
   for (const n of ['WELCOME', 'GENERAL', 'CHALLENGES', 'IPDC RESOURCES', 'IPDC SUPPORT', 'SUPPORT TICKETS', 'ADMIN CONTROL',
-    'welcome', 'announcements', 'general', 'github-contributions', 'contribution-leaderboard', 'server-activity', 'github-challenges',
+    'welcome', 'announcements', 'general', 'github-contributions', 'contribution-leaderboard', 'server-activity',
     'support-center', 'admin-panel', 'server-monitoring', 'admin-approvals', 'admin-audit-logs',
     'General Meeting', 'Open Discussion', 'Coding Room', 'Collaboration Room', 'Support Voice', 'Admin Meeting', 'PM Coordination']) {
     assert.ok(names.includes(n), `missing ${n}`);

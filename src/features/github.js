@@ -58,18 +58,6 @@ export function register(router, ctx) {
     return i.editReply(payload);
   });
 
-  router.select('chal:join', async (i) => {
-    const m = await state.getMember(i.user.id);
-    if (!m || m.status !== 'approved') return say(i, { embeds: [errEmbed('Only approved IPDC members can join challenges.')] });
-    if (!m.github?.username) return say(i, { embeds: [errEmbed('Link your GitHub account first (/ipdc link-github).')] });
-    const ch = await store.get('challenges', i.values[0]);
-    if (!ch || ch.status !== 'active') return say(i, { embeds: [errEmbed('That challenge is no longer active.')] });
-    if (!(ch.participants || []).includes(i.user.id)) { ch.participants = [...(ch.participants || []), i.user.id]; await store.merge('challenges', ch.id, { participants: ch.participants }); }
-    await audit.log({ action: 'challenge.joined', actorId: i.user.id, details: { id: ch.id } });
-    ctx.panels?.refresh?.('challenges');
-    await say(i, { embeds: [okEmbed(`You joined **${ch.title}**. Progress counts activity from now through ${fmtIST(ch.endsAt)}.`)] });
-  });
-
   // ---- slash command: /ipdc ----
   router.command('ipdc', async (i) => {
     const sub = i.options.getSubcommand();
