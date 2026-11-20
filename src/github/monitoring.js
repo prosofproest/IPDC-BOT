@@ -241,9 +241,14 @@ export class Monitoring {
       if (!inactive.length) { if (prev.ids.length) await this.c.store.set('alerts', pm.id, { ids: [], at: Date.now() }); continue; }
       if (!fresh.length && Date.now() - prev.at < 7 * DAY) continue;
       const ch = await this.c.messages.channelFor(KEYS.pmControl(pm.id));
-      await ch?.send({ embeds: [embed({ title: 'INACTIVITY NOTICE', description: `No GitHub activity from these team members in the last ${settings.inactivityDays} days:\n${inactive.map((id) => `<@${id}>`).join(' ')}\n\nThis is a private check-in prompt for the PM, not a performance judgement. Members may be working offline, on other branches, or on non-code tasks.`, footer: NOTE })], allowedMentions: { users: [pm.discordUserId] } }).catch((e) => log.warn('alert post failed', e));
-      await this.c.store.set('alerts', pm.id, { ids: inactive, at: Date.now() });
-      await this.c.audit.log({ action: 'monitoring.inactivity_alert', details: { pmId: pm.id, count: inactive.length } });
+      if (!ch) { log.warn(`inactivity alert channel unavailable for PM ${pm.name}`); continue; }
+      try {
+        await ch.send({ embeds: [embed({ title: 'INACTIVITY NOTICE', description: `No GitHub activity from these team members in the last ${settings.inactivityDays} days:\n${inactive.map((id) => `<@${id}>`).join(' ')}\n\nThis is a private check-in prompt for the PM, not a performance judgement. Members may be working offline, on other branches, or on non-code tasks.`, footer: NOTE })], allowedMentions: { users: [pm.discordUserId] } });
+        await this.c.store.set('alerts', pm.id, { ids: inactive, at: Date.now() });
+        await this.c.audit.log({ action: 'monitoring.inactivity_alert', details: { pmId: pm.id, count: inactive.length } });
+      } catch (e) {
+        log.warn(`alert post failed for PM ${pm.name}`, e);
+      }
     }
   }
 }
